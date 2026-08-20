@@ -109,9 +109,17 @@ def _parent():
 def test_executes_reserved_activation_without_launch_timeout():
     store = _Store()
     lifecycle = _Lifecycle()
+    started = []
 
     result = execute_reserved_activation(
-        store, lifecycle, _parent, "dw-1", _reservation()
+        store,
+        lifecycle,
+        _parent,
+        "dw-1",
+        _reservation(),
+        on_started=lambda active_lifecycle, handle: started.append(
+            (active_lifecycle, handle.subagent_id)
+        ),
     )
 
     assert result["status"] == "SUCCEEDED"
@@ -119,6 +127,7 @@ def test_executes_reserved_activation_without_launch_timeout():
     assert result["report_message_id"] == "report-1"
     assert lifecycle.requests[0].timeout_seconds is None
     assert lifecycle.requests[0].correlation_id == "activation-1"
+    assert started == [(lifecycle, "sa-1")]
     assert store.bound == [("activation-1", "sa-1")]
     assert store.finishes[-1][1]["message_state"] == "CONSUMED"
     assert store.finishes[-1][1]["worker_state"] == "DORMANT"
@@ -148,6 +157,29 @@ def test_incomplete_terminal_state_fails_closed():
 
     assert result["status"] == "CANCEL_REQUESTED"
     assert lifecycle.cancelled
+    assert store.cancel_requested == [("session-1", "dw-1", "activation-1")]
+
+
+def test_supervision_hook_failure_requests_cancellation_and_keeps_worker_locked():
+    store = _Store()
+    lifecycle = _Lifecycle()
+
+    def fail_hook(_lifecycle, _handle):
+        raise RuntimeError("supervision unavailable")
+
+    with pytest.raises(RuntimeError, match="supervision unavailable"):
+        execute_reserved_activation(
+            store,
+            lifecycle,
+            _parent,
+            "dw-1",
+            _reservation(),
+            on_started=fail_hook,
+        )
+
+    assert lifecycle.cancelled == [
+        ("sa-1", "durable activation supervision hook failed")
+    ]
     assert store.cancel_requested == [("session-1", "dw-1", "activation-1")]
 
 

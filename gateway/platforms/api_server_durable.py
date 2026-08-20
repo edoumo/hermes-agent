@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -76,6 +77,8 @@ class DurableWorkersAPIServerAdapter(APIServerAdapter):
         self._dw_activation_tasks: set[asyncio.Task] = set()
         self._dw_dispatch_lock: Optional[asyncio.Lock] = None
         self._dw_event_subscribers = 0
+        self._dw_active_lock = threading.Lock()
+        self._dw_active_lifecycles: dict[str, tuple[Any, Any]] = {}
 
     def _http_route_table(self) -> list[tuple]:
         routes = list(super()._http_route_table())
@@ -87,7 +90,30 @@ class DurableWorkersAPIServerAdapter(APIServerAdapter):
 
     def active_agent_work_count(self) -> int:
         base = super().active_agent_work_count()
-        return base + sum(not task.done() for task in self._dw_activation_tasks)
+        task_count = sum(not task.done() for task in self._dw_activation_tasks)
+        with self._dw_active_lock:
+            lifecycle_count = len(self._dw_active_lifecycles)
+        return base + max(task_count, lifecycle_count)
+
+    def interrupt_active_runs(self, reason: str) -> int:
+        """Interrupt native API runs and active Durable Worker subagents."""
+        interrupted = super().interrupt_active_runs(reason)
+        with self._dw_active_lock:
+            active = list(self._dw_active_lifecycles.values())
+        for lifecycle, handle in active:
+            try:
+                result = lifecycle.cancel(
+                    handle,
+                    reason=f"Gateway shutdown: {str(reason)[:400]}",
+                )
+                if getattr(result, "accepted", False):
+                    interrupted += 1
+            except Exception:
+                logger.debug(
+                    "Failed interrupting Durable Worker activation during drain",
+                    exc_info=True,
+                )
+        return interrupted
 
     @staticmethod
     def _durable_worker_db_path() -> Path:
@@ -536,6 +562,7 @@ class DurableWorkersAPIServerAdapter(APIServerAdapter):
     ) -> dict[str, Any]:
         from agent.subagent_lifecycle import SubagentLifecycleService
 
+        activation_id = str(reserved.get("activation_id") or "")
         with self._profile_scope(request_profile):
             runtime_request, route, session_model = self._dw_runtime_request(session)
             requested = runtime_request.get("requested") or {}
@@ -551,9 +578,26 @@ class DurableWorkersAPIServerAdapter(APIServerAdapter):
             )
             lifecycle = SubagentLifecycleService(lambda: parent)
             store = self._durable_worker_store()
-            return execute_reserved_activation(
-                store, lifecycle, lambda: parent, worker_id, reserved
-            )
+
+            def _started(active_lifecycle: Any, handle: Any) -> None:
+                with self._dw_active_lock:
+                    self._dw_active_lifecycles[activation_id] = (
+                        active_lifecycle,
+                        handle,
+                    )
+
+            try:
+                return execute_reserved_activation(
+                    store,
+                    lifecycle,
+                    lambda: parent,
+                    worker_id,
+                    reserved,
+                    on_started=_started,
+                )
+            finally:
+                with self._dw_active_lock:
+                    self._dw_active_lifecycles.pop(activation_id, None)
 
     async def _dw_execute_reserved_background(self, **kwargs: Any) -> None:
         loop = asyncio.get_running_loop()

@@ -2,7 +2,7 @@
 
 ## Executive summary
 
-H1 has reached an architecture-validated experimental implementation checkpoint.
+H1 has reached an architecture-validated experimental implementation checkpoint with an additional concurrency/crash-recovery hardening pass completed before real-machine validation.
 
 The code proves the intended separation between durable worker identity and short-lived Hermes subagent activations without replacing Hermes delegation, changing the canonical Hermes database, adding DeepSeek Harness as a dependency, or touching production runtime state.
 
@@ -20,7 +20,7 @@ Base: upstream Hermes Agent commit `c47f0b4590e6b5bb05fb73a42f447ca5444f5188` (2
 
 The branch was intentionally based on current upstream rather than the stale `edoumo/hermes-agent` default branch. Existing MITC custom commits will need an explicit rebase/porting decision later; they were not rewritten by H1.
 
-No merge and no pull request have been performed.
+Upstream moved further during H1 development. The post-base delta was reviewed and did not require an immediate rebase for the H1 files. No merge and no pull request have been performed.
 
 ## Architecture retained
 
@@ -50,9 +50,17 @@ The defining invariant is:
 
 ## Activation lifecycle
 
-A pending durable message is atomically claimed. H1 records an activation, launches a fresh Hermes subagent via the public lifecycle API, waits for the terminal result, persists the report and returns the durable worker to `DORMANT`.
+Reservation is atomic. One SQLite `BEGIN IMMEDIATE` transaction moves a worker to `RUNNING`, moves exactly one pending message to `PROCESSING`, and inserts the activation record. This makes the worker state the cross-process serialization boundary and prevents two Hermes processes from activating the same durable worker concurrently.
+
+H1 then launches a fresh Hermes subagent via the public lifecycle API, waits for the terminal result, persists the report and returns the durable worker to `DORMANT` on success.
+
+Timeouts fail closed: H1 requests cancellation but keeps the worker locked in `RUNNING` with the activation marked `CANCEL_REQUESTED` until process-loss recovery can prove the owner disappeared. It never unlocks immediately into a potentially overlapping activation.
 
 If a process disappears during a live activation, startup recovery marks that activation `ABANDONED` and requeues the processing message.
+
+## Process identity safety
+
+Live activation ownership persists both PID and the Hermes process-start marker. Crash recovery therefore detects PID reuse rather than assuming a recycled PID still owns an old activation.
 
 ## Persistence
 
@@ -78,16 +86,20 @@ H1 implements a deliberately small DAG primitive with optional worker ownership,
 
 ## Test results
 
-Local isolated H1 logic tests: `5 passed`.
+Local isolated H1 logic tests after hardening: `8 passed`.
 
-Covered properties:
+Covered properties include:
 
 * durable identity across store/service reconstruction;
-* new activation with prior transcript continuity;
+* distinct activation and subagent across cold service reconstruction;
+* prior transcript continuity;
 * cross-parent authorization denial;
 * inbox idempotency and conflict handling;
-* pending message persistence;
-* abandoned activation recovery;
+* atomic worker/message/activation reservation;
+* two process-like claimers cannot overlap the same worker;
+* timeout keeps the worker locked;
+* abandoned activation recovery and message requeue;
+* PID-reuse-safe owner detection path;
 * task readiness;
 * cycle rejection;
 * stale-revision rejection.
@@ -155,6 +167,6 @@ If the real recipe passes, H2 should focus on:
 
 ## Actions requiring Ed decision
 
-The next decision point is whether to authorize an isolated installation/test of this branch on the Hermes host. That step can be delegated to Diane with a tightly scoped infrastructure mandate, or executed manually from a provided command recipe.
+The next execution step is an isolated installation/test of this branch on the Hermes host. That step requires infrastructure access and should therefore be executed by Diane under a narrowly scoped mandate while the active Hermes runtime remains untouched.
 
 No merge should occur before that validation.

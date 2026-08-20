@@ -1,8 +1,8 @@
 """H1 tests for activation-level durable worker continuity."""
-
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 
@@ -37,21 +37,27 @@ class _State:
 
 
 class _Lifecycle:
-    def __init__(self, summaries):
+    def __init__(self, summaries, prefix="sa", completed=True):
         self.summaries = iter(summaries)
         self.requests = []
         self._results = {}
         self._counter = 0
+        self.prefix = prefix
+        self.completed = completed
+        self.cancelled = []
 
     def launch(self, request):
         self.requests.append(request)
         self._counter += 1
-        handle = SimpleNamespace(subagent_id=f"sa-{self._counter}")
-        self._results[handle.subagent_id] = next(self.summaries)
+        handle = SimpleNamespace(subagent_id=f"{self.prefix}-{self._counter}")
+        self._results[handle.subagent_id] = next(self.summaries, None)
         return handle
 
     def wait(self, handle, timeout_seconds=None):
-        return SimpleNamespace(completed=True, state=_State("SUCCEEDED"))
+        return SimpleNamespace(
+            completed=self.completed,
+            state=_State("SUCCEEDED" if self.completed else "RUNNING"),
+        )
 
     def result(self, handle):
         return SimpleNamespace(
@@ -61,6 +67,7 @@ class _Lifecycle:
         )
 
     def cancel(self, handle, reason):
+        self.cancelled.append((handle.subagent_id, reason))
         return SimpleNamespace(accepted=True)
 
 
@@ -75,7 +82,7 @@ def test_worker_identity_survives_store_and_service_reconstruction(tmp_path):
     db_path = tmp_path / "durable.db"
     parent = SimpleNamespace(session_id="parent-1")
 
-    lifecycle1 = _Lifecycle(["first report"])
+    lifecycle1 = _Lifecycle(["first report"], prefix="sa-first")
     service1 = DurableWorkerService(
         DurableWorkerStore(db_path), lifecycle1, lambda: parent
     )
@@ -86,7 +93,7 @@ def test_worker_identity_survives_store_and_service_reconstruction(tmp_path):
     first_activation = first["activation"]["activation_id"]
     first_subagent = first["activation"]["subagent_id"]
 
-    lifecycle2 = _Lifecycle(["second report"])
+    lifecycle2 = _Lifecycle(["second report"], prefix="sa-second")
     service2 = DurableWorkerService(
         DurableWorkerStore(db_path), lifecycle2, lambda: parent
     )
@@ -94,8 +101,7 @@ def test_worker_identity_survives_store_and_service_reconstruction(tmp_path):
 
     assert second["activation"]["status"] == "SUCCEEDED"
     assert second["activation"]["activation_id"] != first_activation
-    assert second["activation"]["subagent_id"] == "sa-1"
-    assert first_subagent == "sa-1"
+    assert second["activation"]["subagent_id"] != first_subagent
     assert "inspect architecture" in lifecycle2.requests[0].context
     assert "first report" in lifecycle2.requests[0].context
     assert service2.get_worker(worker["worker_id"])["status"] == "DORMANT"
@@ -111,7 +117,8 @@ def test_parent_authority_is_fail_closed(tmp_path):
     worker = service.create_worker(label="security")
 
     other = DurableWorkerService(
-        DurableWorkerStore(db_path), _Lifecycle(["should-not-run"]),
+        DurableWorkerStore(db_path),
+        _Lifecycle(["should-not-run"]),
         lambda: SimpleNamespace(session_id="parent-2"),
     )
     with pytest.raises(DurableWorkerAuthorizationError):
@@ -120,9 +127,8 @@ def test_parent_authority_is_fail_closed(tmp_path):
         other.send(worker["worker_id"], "steal work")
 
 
-def test_inbox_idempotency_and_cold_pending_recovery(tmp_path):
-    db_path = tmp_path / "durable.db"
-    store = DurableWorkerStore(db_path)
+def test_inbox_idempotency_and_atomic_reservation(tmp_path):
+    store = DurableWorkerStore(tmp_path / "durable.db")
     worker = store.create_worker("parent-1", label="worker")
 
     first = store.enqueue_message(
@@ -138,10 +144,66 @@ def test_inbox_idempotency_and_cold_pending_recovery(tmp_path):
             "parent-1", worker["worker_id"], "different", message_id="msg-fixed"
         )
 
-    reopened = DurableWorkerStore(db_path)
-    claimed = reopened.claim_next_message("parent-1", worker["worker_id"])
-    assert claimed["message_id"] == "msg-fixed"
-    assert claimed["state"] == "PROCESSING"
+    reserved = store.reserve_next_activation("parent-1", worker["worker_id"])
+    assert reserved["status"] == "RESERVED"
+    assert reserved["message"]["message_id"] == "msg-fixed"
+    assert store.reserve_next_activation("parent-1", worker["worker_id"])["status"] == "BUSY"
+
+
+def test_two_process_like_claimers_cannot_overlap_same_worker(tmp_path):
+    db_path = tmp_path / "durable.db"
+    seed = DurableWorkerStore(db_path)
+    worker = seed.create_worker("parent-1", label="serialized")
+    seed.enqueue_message("parent-1", worker["worker_id"], "one")
+    seed.enqueue_message("parent-1", worker["worker_id"], "two")
+
+    barrier = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def claim():
+        try:
+            local = DurableWorkerStore(db_path)
+            barrier.wait()
+            results.append(local.reserve_next_activation("parent-1", worker["worker_id"]))
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            errors.append(exc)
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert sorted(result["status"] for result in results) == ["BUSY", "RESERVED"]
+    processing = [
+        msg for msg in seed.list_messages("parent-1", worker["worker_id"])
+        if msg["state"] == "PROCESSING"
+    ]
+    pending = [
+        msg for msg in seed.list_messages("parent-1", worker["worker_id"])
+        if msg["state"] == "PENDING"
+    ]
+    assert len(processing) == 1
+    assert len(pending) == 1
+
+
+def test_timeout_keeps_worker_locked_until_process_recovery(tmp_path):
+    parent = SimpleNamespace(session_id="parent-1")
+    lifecycle = _Lifecycle(["never returned"], completed=False)
+    service = DurableWorkerService(
+        DurableWorkerStore(tmp_path / "durable.db"), lifecycle, lambda: parent
+    )
+    worker = service.create_worker(label="slow")
+    outcome = service.send(worker["worker_id"], "long work", timeout_seconds=1)
+
+    assert outcome["activation"]["status"] == "CANCEL_REQUESTED"
+    assert lifecycle.cancelled
+    assert service.get_worker(worker["worker_id"])["status"] == "RUNNING"
+    service.enqueue(worker["worker_id"], "do not overlap")
+    assert service.run_next(worker["worker_id"])["status"] == "BUSY"
 
 
 def test_task_dag_readiness_cycle_guard_and_revision_cas(tmp_path):

@@ -2,171 +2,196 @@
 
 ## Executive summary
 
-H1 has reached an architecture-validated experimental implementation checkpoint with an additional concurrency/crash-recovery hardening pass completed before real-machine validation.
+H1 Durable Workers has passed the isolated real-runtime recipe on `srv-hermes` with the real configured model `deepseek-v4-flash:0731`.
 
-The code proves the intended separation between durable worker identity and short-lived Hermes subagent activations without replacing Hermes delegation, changing the canonical Hermes database, adding DeepSeek Harness as a dependency, or touching production runtime state.
+The recipe proved that a durable worker identity survives process disappearance, resumes through a new Hermes process, receives a distinct activation and subagent identity, and functionally reuses its persisted transcript. Concurrency serialization, crash recovery, task DAG semantics and parent isolation also passed on the real H1 SQLite store.
 
 ## Final status
 
-`H1_PARTIAL_ARCHITECTURE_VALIDATED`
-
-The remaining gate is an isolated real-Hermes / real-model cold-reactivation recipe. H1 must not be called complete before that recipe succeeds.
+`H1_REAL_RUNTIME_RECIPE_PASS`
 
 ## Git state
 
 Branch: `experimental/durable-workers`
 
-Base: upstream Hermes Agent commit `c47f0b4590e6b5bb05fb73a42f447ca5444f5188` (2026-08-20)
+Historical branch base: `c47f0b4590e6b5bb05fb73a42f447ca5444f5188`
 
-The branch was intentionally based on current upstream rather than the stale `edoumo/hermes-agent` default branch. Existing MITC custom commits will need an explicit rebase/porting decision later; they were not rewritten by H1.
+Real-runtime recipe tested H1 HEAD: `14c9856e15f45f1fcd877ac962f9cbc1e5e56aeb`
 
-Upstream moved further during H1 development. The post-base delta was reviewed and did not require an immediate rebase for the H1 files. No merge and no pull request have been performed.
+Post-recipe plugin contract cleanup removes the unsupported per-launch timeout field from the public `durable_worker` tool surface. No merge and no pull request have been performed.
 
-## Architecture retained
+## Real-runtime recipe
 
-`DurableWorkerStore` owns durable worker identity, inbox/transcript, activation ledger, reports and a minimal task DAG.
+Environment:
 
-`DurableWorkerService` resolves the active parent, enforces parent ownership and delegates execution to the existing public Hermes `SubagentLifecycleService`.
+* H1 home: `/home/edou/lab/hermes-durable-workers-h1/hermes-home`
+* H1 virtualenv: `/home/edou/lab/hermes-durable-workers-h1/venv`
+* model: `deepseek-v4-flash:0731`
+* plugin: `durable-workers`
+* primary Hermes runtime touched: `NO`
+* primary Hermes home touched: `NO`
 
-The bundled `durable-workers` plugin is the first consumer and is opt-in.
+Targeted validation:
 
-## Architecture rejected
+* H1 tests: `8/8 PASS`
+* public subagent lifecycle tests: `4/4 PASS`
+* plugin loading suite: `180 PASS` after installing the required `pytest-asyncio` test dependency in the isolated lab
 
-* no serialized `AIAgent`;
-* no second agent loop;
-* no replacement of `delegate_tool`;
-* no DeepSeek Harness runtime dependency;
-* no Redis/Kafka/PostgreSQL service;
-* no canonical `state.db` migration in H1;
-* no UI reading SQLite directly.
+## Cold resume proof
 
-## DurableWorker contract
+Stable worker identity:
 
-A worker contains stable `worker_id`, parent session ownership, label, role, optional model/toolsets, status, revision and last activation reference.
+`dw_1a91f9594cb9442fab831b84a12c825d`
 
-The defining invariant is:
+Activation 1:
+
+* activation: `dwa_5c1ffb5ed046403fac7aba983e320e46`
+* subagent: `sa-0-bb084d8b`
+
+The first H1 process then disappeared.
+
+Activation 2 ran in a new Hermes process:
+
+* activation: `dwa_c6c38586669747ed856b2837d14f05b5`
+* subagent: `sa-0-8b1dd797`
+
+The second activation was not given the original marker again, yet returned the exact marker `H1-COLD-RESUME-20260820T214341` from the durable transcript and explicitly confirmed context presence. This is functional continuity evidence, not merely evidence that the text existed in SQLite.
+
+Validated invariants:
+
+`worker_id_1 == worker_id_2`
+
+`activation_id_1 != activation_id_2`
+
+`subagent_id_1 != subagent_id_2`
 
 `worker_id != activation_id != subagent_id`
 
-## Activation lifecycle
+## Concurrency serialization
 
-Reservation is atomic. One SQLite `BEGIN IMMEDIATE` transaction moves a worker to `RUNNING`, moves exactly one pending message to `PROCESSING`, and inserts the activation record. This makes the worker state the cross-process serialization boundary and prevents two Hermes processes from activating the same durable worker concurrently.
+Two independent process-like claimers used the same durable worker database with two pending messages.
 
-H1 then launches a fresh Hermes subagent via the public lifecycle API, waits for the terminal result, persists the report and returns the durable worker to `DORMANT` on success.
+Observed result:
 
-Timeouts fail closed: H1 requests cancellation but keeps the worker locked in `RUNNING` with the activation marked `CANCEL_REQUESTED` until process-loss recovery can prove the owner disappeared. It never unlocks immediately into a potentially overlapping activation.
+* exactly one activation reservation succeeded;
+* the competing claimant received `BUSY`;
+* one message became `CONSUMED`;
+* one remained `PENDING`;
+* only one subagent activation existed for the worker.
 
-If a process disappears during a live activation, startup recovery marks that activation `ABANDONED` and requeues the processing message.
+The worker-level SQLite reservation is therefore a valid cross-process serialization boundary for H1.
 
-## Process identity safety
+## Crash recovery
 
-Live activation ownership persists both PID and the Hermes process-start marker. Crash recovery therefore detects PID reuse rather than assuming a recycled PID still owns an old activation.
+A dedicated experimental process was killed during a long activation.
 
-## Persistence
+On restart:
 
-H1 uses `HERMES_HOME/durable-workers.db`, SQLite with foreign keys and WAL where available.
+* the previous activation became `ABANDONED`;
+* its `PROCESSING` message returned to `PENDING`;
+* the worker returned to `DORMANT`;
+* a subsequent `run_next` created a new activation and completed successfully.
 
-This database is intentionally separate from canonical Hermes state for the experimental phase.
+The main Hermes runtime was not affected.
 
-## Inbox and reporting
+## Task DAG and parent isolation
 
-Parent messages have stable message IDs and idempotent enqueue behavior. A reused ID with different durable content is rejected.
+The real H1 store validated:
 
-Successful worker summaries are persisted as worker-direction transcript entries and activation summaries.
-
-## Authorization model
-
-Workers and tasks are scoped to `parent_session_id`. Cross-parent worker and task access fails closed.
-
-No credentials, live agent instances, callbacks, sockets, threads or LLM clients are persisted.
-
-## Task DAG
-
-H1 implements a deliberately small DAG primitive with optional worker ownership, `blocked_by`, derived readiness, cycle rejection and integer revision compare-and-set updates.
-
-## Test results
-
-Local isolated H1 logic tests after hardening: `8 passed`.
-
-Covered properties include:
-
-* durable identity across store/service reconstruction;
-* distinct activation and subagent across cold service reconstruction;
-* prior transcript continuity;
-* cross-parent authorization denial;
-* inbox idempotency and conflict handling;
-* atomic worker/message/activation reservation;
-* two process-like claimers cannot overlap the same worker;
-* timeout keeps the worker locked;
-* abandoned activation recovery and message requeue;
-* PID-reuse-safe owner detection path;
-* task readiness;
+* A -> B/C -> D readiness transitions;
 * cycle rejection;
-* stale-revision rejection.
+* stale revision compare-and-set rejection;
+* cross-parent read and write denial.
 
-## CI
+## Production isolation
 
-No PR was authorized and the current upstream CI runs on pull requests or pushes to `main`. Therefore there is no branch CI verdict at this checkpoint.
+The recipe did not modify the primary Hermes runtime.
 
-## Production impact
+Observed primary process identities remained intact and the primary `config.yaml` SHA256 was unchanged before and after the recipe.
 
-None.
+No systemd mutation, network mutation, firewall mutation, production deployment, merge or pull request occurred.
 
-No `srv-hermes` change, service restart, systemd change, profile change, plugin enablement, database migration, firewall change, network change, or production deployment occurred.
+## Contract findings from the real recipe
 
-## Compatibility
+### Timeout semantics
 
-H1 consumes the public Hermes subagent lifecycle contract rather than private child registries. This maximizes compatibility with current delegation safety and avoids a forked child-agent implementation.
+The current Hermes `SubagentLifecycleService` exposes `timeout_seconds` on `SubagentLaunchRequest` for contract completeness but explicitly rejects per-launch timeout in `_validate_request()`.
 
-The plugin remains disabled unless explicitly enabled through Hermes plugin configuration.
+Durable Workers therefore must not expose this as a child-launch option. The H1 plugin surface has been cleaned up accordingly. If H2 needs a deadline, it should be modeled as a host-side wait/cancel deadline rather than a delegated launch timeout.
 
-## DeepSeek Harness concepts adopted
+### Toolset narrowing
 
-Conceptually adopted:
+A durable worker's requested toolsets must be a subset of the active parent Hermes toolsets. Hermes correctly rejects attempts that would broaden parent permissions.
 
-* durable identity separate from activation;
-* continuable worker through fresh activation;
-* durable inbox;
-* explicit parent relationship;
-* durable reports;
-* small dependency graph;
-* UI/API separation.
+H2/API documentation must preserve this as a security invariant, not work around it.
 
-Not adopted:
+### Stable parent identity
 
-* DeepSeek runtime;
-* Cordis dependency;
-* DSH session format;
-* DSH memory stack;
-* DSH web server as a Hermes dependency.
+Cold resume is scoped by `parent_session_id`. A restart therefore requires a stable named parent session identity. In the recipe this was achieved with the named session `h1-recipe`.
 
-## Hermes-Harness-UI consequence
+A volatile unnamed session receives a new parent identity and cannot address the previous worker. H2 should make this requirement explicit and consider introducing an explicit durable parent/workspace identity instead of depending on an incidental runtime session identifier.
 
-The H1 service is intentionally UI agnostic. The next UI-facing stage should expose bounded, typed Hermes APIs around workers, messages, activation history and tasks. Hermes-Harness-UI should consume those APIs and incremental events rather than import Hermes runtime code or read SQLite.
+### Test environment dependency
 
-## Known limitations
+The full plugin loading suite requires `pytest-asyncio`. Missing it caused environment/setup failures rather than H1 functional failures. After installation in the isolated virtualenv, all 180 plugin-loading tests passed.
 
-* real-model cold reactivation has not yet been exercised on `srv-hermes`;
-* branch CI has not run because no PR/main push was authorized;
-* H1 is activation-level continuation, not mid-tool/mid-token checkpointing;
-* transcript continuation currently uses a bounded textual context rather than native persisted child-session replay;
-* worker task DAG is intentionally minimal;
-* the current experimental store is a separate database and is not yet part of canonical backup/migration policy.
+## Architecture retained
+
+H1 keeps the established architecture:
+
+* persistent worker identity separated from activation;
+* fresh Hermes subagent activation for every turn;
+* durable inbox and transcript;
+* parent-scoped authorization;
+* atomic worker/message/activation reservation;
+* process-loss recovery using PID plus process-start marker;
+* separate experimental `durable-workers.db`;
+* minimal task DAG;
+* UI-independent service boundary.
+
+H1 still does not serialize `AIAgent`, credentials, clients, threads, sockets or callbacks.
+
+## Known boundaries
+
+H1 is activation-level continuation. It does not checkpoint an LLM generation or tool call mid-execution.
+
+The transcript is currently reconstructed as bounded textual context rather than native persisted child-session replay.
+
+The separate H1 SQLite store is still experimental and is not yet part of canonical Hermes backup/migration policy.
+
+The durable parent identity contract needs to be formalized in H2.
+
+## Evidence
+
+Evidence directory:
+
+`/home/edou/lab/hermes-durable-workers-h1/evidence/`
+
+Archive:
+
+`/home/edou/lab/hermes-durable-workers-h1/evidence/h1-real-runtime-recipe-evidence.tar.gz`
+
+SHA256:
+
+`f35904be6a359cbe9175899016c27cf1b69f658f91af1b429b6b630d27d15e63`
 
 ## H2 recommendation
 
-Proceed to the isolated real-machine recipe before deciding H2.
+H1 has cleared its real-runtime gate. H2 may now start.
 
-If the real recipe passes, H2 should focus on:
+Recommended H2 scope:
 
-1. typed Gateway/API operations for durable workers;
-2. pagination and incremental event delivery suitable for Hermes-Harness-UI;
-3. optional consolidation with canonical Hermes state;
-4. operational observability and quotas;
-5. explicit migration/porting of the MITC Hermes custom commits onto the chosen modern upstream base.
+1. a typed Hermes API around durable workers, activations, messages and tasks;
+2. stable durable parent/workspace identity;
+3. pagination for worker transcripts and activation history;
+4. incremental event delivery for Hermes Harness UI;
+5. explicit observable fields such as last error, current activity, duration, usage and cost where Hermes can provide them safely;
+6. capability-preserving toolset validation at the API boundary;
+7. no UI direct access to SQLite;
+8. no public exposure of the stock runtime API without authentication and authorization.
 
-## Actions requiring Ed decision
+## Final verdict
 
-The next execution step is an isolated installation/test of this branch on the Hermes host. That step requires infrastructure access and should therefore be executed by Diane under a narrowly scoped mandate while the active Hermes runtime remains untouched.
+`H1_REAL_RUNTIME_RECIPE_PASS`
 
-No merge should occur before that validation.
+H1 has demonstrated durable identity, true process-boundary cold resume, functional context continuity, concurrency serialization, crash recovery, task DAG behavior and parent isolation on the real Hermes host while leaving the active runtime intact.

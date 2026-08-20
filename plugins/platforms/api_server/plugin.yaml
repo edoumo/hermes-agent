@@ -1,11 +1,13 @@
 name: api-server-durable-workers
 label: API Server Durable Workers
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
-  Experimental H2 extension for the built-in Hermes API server. The platform
+  Experimental H2.1 extension for the built-in Hermes API server. The platform
   factory preserves the stock APIServerAdapter unless
   platforms.api_server.extra.durable_workers_api is explicitly enabled.
-  When enabled, session-scoped read-only Durable Worker routes are added for
-  Hermes Harness UI qualification.
+  When enabled, session-scoped Durable Worker reads, bounded write/control
+  operations, activation dispatch and an authenticated SSE invalidation feed
+  are added for Hermes Harness UI qualification. The extension reuses the
+  existing Hermes listener, bearer authentication, CORS and profile scope.
 author: MITC

@@ -8,7 +8,9 @@ import plugins.platforms.api_server as plugin
 def test_factory_keeps_stock_api_server_by_default(monkeypatch):
     monkeypatch.setattr(plugin, "APIServerAdapter", lambda cfg: ("stock", cfg))
     monkeypatch.setattr(
-        plugin, "DurableWorkersAPIServerAdapter", lambda cfg: ("durable", cfg)
+        plugin,
+        "DurableWorkersRuntimeAPIServerAdapter",
+        lambda cfg: ("durable", cfg),
     )
     cfg = SimpleNamespace(extra={})
     assert plugin._factory(cfg)[0] == "stock"
@@ -17,7 +19,9 @@ def test_factory_keeps_stock_api_server_by_default(monkeypatch):
 def test_factory_requires_explicit_h2_opt_in(monkeypatch):
     monkeypatch.setattr(plugin, "APIServerAdapter", lambda cfg: ("stock", cfg))
     monkeypatch.setattr(
-        plugin, "DurableWorkersAPIServerAdapter", lambda cfg: ("durable", cfg)
+        plugin,
+        "DurableWorkersRuntimeAPIServerAdapter",
+        lambda cfg: ("durable", cfg),
     )
     for enabled in (True, "true", "1", "yes", "on", 1):
         cfg = SimpleNamespace(extra={"durable_workers_api": enabled})

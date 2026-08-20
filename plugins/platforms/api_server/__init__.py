@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from gateway.platforms.api_server import AIOHTTP_AVAILABLE, APIServerAdapter
-from gateway.platforms.api_server_durable import DurableWorkersAPIServerAdapter
+from gateway.platforms.api_server_durable_runtime import (
+    DurableWorkersRuntimeAPIServerAdapter,
+)
 
 
 def _enabled(value: Any) -> bool:
@@ -22,7 +24,7 @@ def _factory(config):
     """Return the stock adapter unless H2 is explicitly opted in."""
     extra = getattr(config, "extra", {}) or {}
     if _enabled(extra.get("durable_workers_api")):
-        return DurableWorkersAPIServerAdapter(config)
+        return DurableWorkersRuntimeAPIServerAdapter(config)
     return APIServerAdapter(config)
 
 

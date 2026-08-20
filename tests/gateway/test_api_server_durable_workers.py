@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -87,6 +88,26 @@ def test_h2_identifier_rejects_control_characters():
         DurableWorkersAPIServerAdapter._dw_identifier(
             "bad\nvalue", field="message_id"
         )
+
+
+def test_gateway_drain_interrupts_active_durable_lifecycle():
+    adapter = object.__new__(DurableWorkersAPIServerAdapter)
+    adapter._active_run_agents = {}
+    adapter._shutdown_interruptible_agents = {}
+    adapter._dw_active_lock = threading.Lock()
+    calls = []
+
+    class Lifecycle:
+        def cancel(self, handle, *, reason):
+            calls.append((handle.subagent_id, reason))
+            return SimpleNamespace(accepted=True)
+
+    adapter._dw_active_lifecycles = {
+        "activation-1": (Lifecycle(), SimpleNamespace(subagent_id="sa-1"))
+    }
+
+    assert adapter.interrupt_active_runs("test drain") == 1
+    assert calls == [("sa-1", "Gateway shutdown: test drain")]
 
 
 class _FakeStore:

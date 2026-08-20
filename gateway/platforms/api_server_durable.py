@@ -61,7 +61,7 @@ class DurableWorkersAPIServerAdapter(APIServerAdapter):
         ("GET", "/api/sessions/{session_id}/workers/{worker_id}/activations", "_handle_dw_activations"),
         ("GET", "/api/sessions/{session_id}/worker-tasks", "_handle_dw_tasks"),
         ("POST", "/api/sessions/{session_id}/worker-tasks", "_handle_dw_create_task"),
-        ("PATCH", "/api/sessions/{session_id}/worker-tasks/{task_id}", "_handle_dw_update_task"),
+        ("POST", "/api/sessions/{session_id}/worker-tasks/{task_id}/status", "_handle_dw_update_task"),
         ("POST", "/api/sessions/{session_id}/worker-tasks/{task_id}/dependencies", "_handle_dw_add_dependency"),
     )
 

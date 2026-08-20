@@ -7,7 +7,7 @@ introducing a second agent loop or serializing live agent objects.
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from agent.durable_workers import (
     DurableWorkerAuthorizationError,
@@ -31,6 +31,8 @@ def execute_reserved_activation(
     parent_resolver: Callable[[], Any],
     worker_id: str,
     reserved: dict[str, Any],
+    *,
+    on_started: Optional[Callable[[Any, Any], None]] = None,
 ) -> dict[str, Any]:
     """Execute one activation previously returned by reserve_next_activation.
 
@@ -38,6 +40,11 @@ def execute_reserved_activation(
     never reserves a second message and never accepts a per-launch timeout,
     because Hermes' public lifecycle contract explicitly rejects launch-level
     timeouts. Runtime timeout policy stays owned by Hermes delegation config.
+
+    ``on_started`` is a transient in-process supervision hook. It receives the
+    lifecycle service and live handle only after the durable activation has
+    been bound to its subagent. Callers may use it for cooperative shutdown;
+    it is never persisted and is not part of the public HTTP representation.
     """
     parent = _parent_session_id(parent_resolver)
     if reserved.get("status") != "RESERVED":
@@ -102,6 +109,18 @@ def execute_reserved_activation(
         finally:
             store.mark_cancel_requested(parent, worker_id, activation_id)
         raise
+
+    if on_started is not None:
+        try:
+            on_started(lifecycle, handle)
+        except Exception:
+            try:
+                lifecycle.cancel(
+                    handle, reason="durable activation supervision hook failed"
+                )
+            finally:
+                store.mark_cancel_requested(parent, worker_id, activation_id)
+            raise
 
     terminal = lifecycle.wait(handle)
     if not terminal.completed:

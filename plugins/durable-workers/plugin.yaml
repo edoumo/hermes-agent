@@ -1,0 +1,4 @@
+name: durable-workers
+version: "0.1.0"
+description: "Experimental H1 durable worker identities with persistent inbox, activation history, cold reactivation, and task dependencies. Opt-in only."
+author: "MITC / Edwige"

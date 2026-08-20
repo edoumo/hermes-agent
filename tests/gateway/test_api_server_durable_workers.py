@@ -45,8 +45,8 @@ def test_durable_worker_routes_extend_native_api_table():
     ) in routes
     assert ("POST", "/api/sessions/{session_id}/worker-tasks") in routes
     assert (
-        "PATCH",
-        "/api/sessions/{session_id}/worker-tasks/{task_id}",
+        "POST",
+        "/api/sessions/{session_id}/worker-tasks/{task_id}/status",
     ) in routes
     assert (
         "POST",
@@ -55,7 +55,7 @@ def test_durable_worker_routes_extend_native_api_table():
     assert ("GET", "/api/sessions/{session_id}/worker-events") in routes
 
     assert not any(
-        method in {"DELETE", "PUT"}
+        method in {"DELETE", "PUT", "PATCH"}
         and ("/workers" in path or "/worker-tasks" in path)
         for method, path in routes
     )
@@ -185,8 +185,9 @@ async def test_run_handler_returns_reserved_activation_before_background_complet
     assert payload["status"] == "STARTING"
     assert len(adapter._dw_activation_tasks) == 1
 
+    task = next(iter(adapter._dw_activation_tasks))
     release.set()
-    await asyncio.gather(*list(adapter._dw_activation_tasks))
+    await task
 
 
 @pytest.mark.asyncio

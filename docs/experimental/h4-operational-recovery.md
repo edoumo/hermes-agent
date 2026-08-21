@@ -1,6 +1,6 @@
 # H4 Durable Worker Operational Recovery & Control
 
-Status: `H4_BACKEND_CODE_IN_PROGRESS`
+Status: `H4_BACKEND_CODE_READY_FOR_INTEGRATED_QUALIFICATION`
 
 Branch: `experimental/durable-workers-operational-recovery`
 
@@ -142,8 +142,10 @@ The existing platform factory test is updated to expect the H4 adapter while pre
 
 ## Qualification status
 
-No main runtime has been changed and no real H4 recipe has run yet.
+Backend implementation, API wiring, contract tests and documentation are complete for the first H4 slice and ready for isolated integrated qualification.
 
-The development environment cannot currently resolve `github.com`, so repository pytest execution must not be claimed from the authoring environment. Integrated tests and real lifecycle cancellation will be a later isolated lab gate after code/UI completion.
+No principal runtime has been changed and no real H4 recipe has run yet.
+
+The development environment cannot currently resolve `github.com`, so repository pytest execution must not be claimed from the authoring environment. The integrated lab must run the targeted test suites and prove real lifecycle cancellation/retry behavior before H4 can be marked PASS.
 
 No PR or merge is authorized at this stage.

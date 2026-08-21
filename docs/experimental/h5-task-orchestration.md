@@ -1,211 +1,133 @@
 # H5 Durable Task Orchestration
 
-Status: `H5_BACKEND_CODE_IN_PROGRESS`
+Status: `H5_TASK_ORCHESTRATION_STATUS=PASS`
 
 Branch: `experimental/durable-workers-task-orchestration`
 
+Qualified backend behavior SHA: `ea254053c82929fc44646b6cb4c8456498d5deb4`
+
 H4 baseline: `ab693e298d76a9fd8d65f174870a7c88cf68c962`
 
-Plugin candidate: `api-server-durable-workers 0.4.0`
+Qualified plugin: `api-server-durable-workers 0.4.0`
 
 ## Objective
 
-H5 turns the existing Durable Worker task metadata into an operational DAG without introducing a second execution engine.
+H5 turns Durable Worker task metadata into a real operational DAG without introducing a second execution engine. H1-H4 remain authoritative for durable worker identity, inbox, activation serialization, lifecycle, cancellation, retry, crash recovery, API authentication and SSE. H5 owns the task graph, CAS-safe task edits, dependency management, atomic READY dispatch and task-result reconciliation.
 
-H1/H4 remain authoritative for:
+## Qualified behavior
 
-- durable worker identity;
-- durable inbox/messages;
-- activation serialization;
-- subagent lifecycle;
-- cancellation and retry;
-- crash recovery;
-- authenticated API/SSE.
+The isolated real-runtime qualification completed with `H5_TASK_ORCHESTRATION_STATUS=PASS` on backend SHA `ea254053c82929fc44646b6cb4c8456498d5deb4` and Harness SHA `97f614f19cb71439028287ed87bc11679ebe76db`.
 
-H5 owns only:
+Backend tests: 45/45 PASS (25 H5 plus 20 H4 non-regression).
 
-- safe editing of pending task definitions and worker assignment;
-- CAS-safe dependency add/remove;
-- a bounded read-only graph projection;
-- atomic dispatch of a READY task into the existing Durable Worker activation lifecycle;
-- projection of terminal activation results back into task state.
+Python compilation: PASS.
 
-## Task state semantics
+Factory behavior: stock `APIServerAdapter` by default, `DurableWorkersTaskRecoveryAPIServerAdapter` only when Durable Workers API is explicitly enabled. No new listener is introduced.
 
-Existing task states remain:
+Route table: PASS with 59 routes total, 10 H5 routes, no duplicates and no H5 DELETE/PUT/PATCH controls.
 
-- `pending`
-- `in_progress`
-- `completed`
-- `failed`
-- `cancelled`
+## DAG semantics
 
-`ready=true` is derived only when a task is `pending` and every blocker is `completed`.
+Task states remain `pending`, `in_progress`, `completed`, `failed`, `cancelled`.
 
-H5 never persists a separate READY state.
+`ready` remains derived. It is true only for a pending task whose blockers are all completed. H5 does not persist a separate READY state.
 
-## DAG editing
+The qualification proved a four-node reference DAG with exact edges and automatic backend-driven progression:
 
-Task definition, worker assignment and dependency changes are allowed only while a task is `pending`.
+- root task READY;
+- direct dependents BLOCKED;
+- final join task BLOCKED;
+- root completion automatically makes the direct dependents READY;
+- completion of both direct dependents automatically makes the final task READY.
 
-Every H5 edit uses `expected_revision`.
+Blocked dispatch is rejected before creating any message, activation or task-run row.
 
-Dependency additions reject cycles. Dependency add/remove increments the task revision when the edge changes.
+## CAS-safe task administration
 
-The legacy H2.1 task routes remain available for compatibility; H5 UI uses the stricter H5 routes.
+Pending tasks support subject/description edit, worker assignment/unassignment and reassignment using `expected_revision`.
+
+Stale revisions return conflict without mutation.
+
+Dependency add/remove increments revision and cycle creation is rejected without adding the edge.
 
 ## Atomic task dispatch
 
-A H5 dispatch is not a client-side sequence of `enqueue` then `run`.
+Task dispatch validates session ownership, task revision, task state, blockers, assigned worker state and worker inbox ordering before reserving anything.
 
-`DurableTaskOrchestrator.reserve_ready_task()` uses one `BEGIN IMMEDIATE` transaction to validate and reserve all durable state.
+A successful dispatch atomically creates or reuses the task-correlated durable parent message, creates a new Durable Worker activation, moves the worker to RUNNING, moves the task to `in_progress`, and records the task/message/activation audit relation.
 
-Preconditions:
+The reservation is then executed through the already-qualified Durable Worker lifecycle. H5 does not persist live lifecycle handles, AIAgent objects, callbacks, threads or sockets.
 
-- task belongs to the addressed session;
-- task is `pending`;
-- `expected_revision` matches;
-- all dependencies are completed;
-- a worker is assigned and belongs to the same session;
-- worker is `DORMANT`;
-- worker has no older pending parent inbox message.
+Real DeepSeek dispatch was qualified. Task, message, activation and worker moved through the expected durable states and reconciled to `completed` / `SUCCEEDED` / `CONSUMED` / `DORMANT` only after the child completed successfully.
 
-Atomic transition:
+## Cancellation and redispatch
 
-- create task-correlated parent message in `PROCESSING`;
-- create Durable Worker activation in `STARTING`;
-- worker `DORMANT -> RUNNING`, revision increments;
-- task `pending -> in_progress`, revision increments;
-- persist task/message/activation audit link.
+H4 operator cancellation remains authoritative.
 
-The returned reservation is executed by the already-qualified H2.1/H4 activation path.
+During `CANCEL_REQUESTED`, qualification proved atomically that task stays `in_progress`, worker stays `RUNNING` and message stays `PROCESSING`. No redispatch overlap occurs.
 
-No live `AIAgent`, lifecycle handle, callback, thread or process object is persisted.
+Only after terminal `CANCELLED` does the task return to `pending`, the worker to `DORMANT` and the task message to `PENDING`.
 
-## Result reconciliation
+Redispatch reuses the same durable task message while creating a new activation id and new subagent id. The previous cancelled activation remains audit history.
 
-When the existing lifecycle finishes:
+## Fail-closed recovery
 
-- `SUCCEEDED` -> task `completed`;
-- operator `CANCELLED` with H4 `retryable=true` -> task back to `pending`;
-- fail-closed/system failure -> task `failed`;
-- `CANCEL_REQUESTED` remains `in_progress` until durable terminal/recovery state is known.
+A system drain that does not use the operator-cancel route keeps H4 fail-closed semantics. Qualification proved worker `FAILED`, message `FAILED`, task `failed` and preserved failed activation history.
 
-The worker/message/activation transitions remain owned by H1/H4. H5 only updates the task and its audit row after observing that result.
+`Recover task` restores the failed task, worker and task-owned message atomically to `pending` / `DORMANT` / `PENDING` under revision CAS. Redispatch keeps the same message id and creates a new activation/subagent.
 
-## Audit table
+## Crash/restart recovery
 
-H5 adds:
+A real lab backend was killed with SIGKILL while a task activation was running.
 
-`durable_worker_task_runs`
+On restart, H1 recovered the activation to `ABANDONED`, the worker to `DORMANT` and the message to `PENDING`. H5 startup reconciliation moved the task from `in_progress` back to `pending` and recorded the recovered durable state in the task-run audit.
 
-It records only durable identifiers and result metadata:
+The task then redispatched with the same message id and a new activation id and completed successfully.
 
-- task id;
-- worker id;
-- message id;
-- activation id;
-- state;
-- timestamps;
-- bounded summary/error.
+## Inbox ordering
 
-It does not store:
+H5 never overtakes an unrelated pending parent message already queued for the assigned worker. Dispatch is rejected and creates no task activation in that case.
 
-- PID/birth marker;
-- live lifecycle handles;
-- credentials;
-- model secrets;
-- browser state.
+## Public graph projection
 
-## Read-only graph projection
+The graph is session scoped and bounded to at most 100 task nodes. Unknown query parameters and limits above 100 are rejected.
 
-`DurableTaskGraphProjection` opens SQLite with:
+Public task-run summary/error fields are bounded to 2000 characters. Display relation lists are bounded while readiness continues to be computed from all real dependencies.
 
-- `mode=ro`;
-- `PRAGMA query_only=ON`.
+The public graph excludes owner PID/birth markers, live handles, Bearer credentials and secrets.
 
-The graph is bounded to 100 task nodes and returns:
+## Capacity and isolation
 
-- tasks;
-- `blocked_by`;
-- `dependents`;
-- derived `ready`;
-- edges;
-- state counts;
-- latest durable task-run identifiers/metadata when available;
-- `truncated=true` when the session has more nodes than returned.
+H5 shares the existing Durable Worker process-wide activation capacity. With cap=1, a second H5 dispatch was correctly rejected with `429 durable_worker_capacity` while another activation was running and accepted after capacity was released.
 
-It remains session scoped and excludes host recovery details.
+Cross-session graph, edit, dependency, dispatch and recover accesses fail closed. Invalid query strings do not bypass object ownership semantics.
 
-## H5 API additions
+## Harness / SSE
 
-### GET `/api/sessions/{session_id}/worker-task-graph`
+The H5 Harness graph is session-level, uses backend-projected readiness and preserves H3's single EventSource ownership. No H5 JavaScript creates an EventSource or stores graph/transcript data in localStorage.
 
-Optional `limit`, 1..100.
+Real UI transitions for dispatch, completion, cancellation, recovery and redispatch occurred without manual refresh. DOM growth remained bounded and no SSE 429/reconnect storm was observed.
 
-### POST `/api/sessions/{session_id}/worker-tasks/{task_id}/edit`
+## Qualification evidence
 
-Supports pending-task changes to:
+Evidence directory:
 
-- `subject`;
-- `description`;
-- `worker_id` (including null/unassigned);
-- required `expected_revision`.
+`/home/edou/lab/hermes-durable-workers-h5/evidence-h5/`
 
-### POST `/api/sessions/{session_id}/worker-tasks/{task_id}/dependencies/add`
+Archive:
 
-Body includes:
+`/home/edou/lab/hermes-durable-workers-h5/evidence-h5/h5-task-orchestration-evidence.tar.gz`
 
-- `blocked_by_task_id`;
-- `expected_revision`.
+SHA256:
 
-### POST `/api/sessions/{session_id}/worker-tasks/{task_id}/dependencies/remove`
+`48706e3b31f39f4ae7fca88233ab787f7c1f7659d2b96b89438aef59537f0e43`
 
-Same CAS contract.
-
-### POST `/api/sessions/{session_id}/worker-tasks/{task_id}/dispatch`
-
-Body:
-
-```json
-{"expected_revision": 7}
-```
-
-Accepted dispatch returns HTTP 202 with task, worker, message and activation ids.
-
-## API inheritance
-
-`DurableWorkersTaskOrchestrationAPIServerAdapter` subclasses the qualified H4 `DurableWorkersControlAPIServerAdapter`.
-
-No listener is added.
-
-Default `durable_workers_api` off behavior remains stock `APIServerAdapter`.
-
-H5 dispatch shares the existing process-wide activation capacity and `_dw_dispatch_lock` used by normal Durable Worker runs.
-
-## Tests added
-
-- `tests/agent/test_durable_task_orchestration.py`
-- `tests/gateway/test_api_server_durable_task_orchestration.py`
-- H5 factory expectation in `tests/plugins/test_api_server_durable_workers_platform.py`
+The evidence archive was scanned for lab keys/passwords and reported clean.
 
 ## Qualification boundary
 
-The authoring environment cannot resolve `github.com`, so no repository-level pytest result is claimed here.
+The principal Hermes runtime, legacy WebUI and main configuration were not modified. Lab processes and ports were cleanly shut down.
 
-Before H5 can become PASS, an isolated lab must prove:
+One obsolete H4 static WebUI test was reported during qualification. It asserted a literal direct import of the H4 BFF from `harness_server.py`; H5 correctly layers through `harness_ui_task_recovery` which delegates to H5 tasks and H4 operations. This is a test-hygiene issue only and does not change this H5 behavior PASS.
 
-- repository tests green;
-- graph/session isolation;
-- CAS edit/dependency behavior;
-- cycle rejection;
-- real READY task dispatch with DeepSeek;
-- automatic task `in_progress -> completed` on success;
-- operator cancel returns task to `pending` only after terminal H4 cancellation;
-- system drain/failure yields task `failed`;
-- retry/reset and redispatch create a new activation;
-- no task dispatch overtakes an older pending worker inbox message;
-- H4 cancel/retry and H3 SSE remain non-regressed;
-- principal runtime remains untouched.
-
-No PR, merge or principal runtime mutation is authorized.
+No PR, merge, main/master update or principal runtime deployment is authorized by this qualification.

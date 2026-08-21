@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.durable_workers import DurableWorkerAuthorizationError
+from agent.durable_workers_api import NotFoundError
 from gateway.platforms.api_server_durable_control import (
     DurableWorkersControlAPIServerAdapter,
 )
@@ -38,7 +38,6 @@ def test_h4_query_guard_accepts_only_empty_query_string():
     )
     _assert_invalid_query(response)
 
-    # Keep a fallback for request doubles exposing only .query.
     response = DurableWorkersControlAPIServerAdapter._dw_control_query_error(
         SimpleNamespace(query={"x": "1"})
     )
@@ -62,20 +61,23 @@ async def test_operations_rejects_query_before_reading_control_state():
 
 
 @pytest.mark.asyncio
-async def test_retry_checks_worker_ownership_then_rejects_query_before_body_or_mutation():
+async def test_retry_checks_read_only_worker_ownership_then_rejects_query():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
     sequence = []
 
-    class Store:
+    class Projection:
         def get_worker(self, parent, worker_id):
-            sequence.append(("ownership", parent, worker_id))
+            sequence.append(("projection", parent, worker_id))
             return {"worker_id": worker_id, "parent_session_id": parent}
 
     async def _unexpected_body(_request):
         raise AssertionError("retry query must be rejected before body read")
 
-    adapter._durable_worker_store = lambda: Store()
+    adapter._durable_worker_projection = lambda: Projection()
+    adapter._durable_worker_store = lambda: (_ for _ in ()).throw(
+        AssertionError("invalid query must not construct the mutable store")
+    )
     adapter._read_json_body = _unexpected_body
     adapter._durable_worker_control = lambda: (_ for _ in ()).throw(
         AssertionError("retry query must be rejected before mutation")
@@ -86,7 +88,7 @@ async def test_retry_checks_worker_ownership_then_rejects_query_before_body_or_m
     )
     response = await adapter._handle_dw_retry_worker(request)
     _assert_invalid_query(response)
-    assert sequence == [("ownership", "session-1", "dw-1")]
+    assert sequence == [("projection", "session-1", "dw-1")]
 
 
 @pytest.mark.asyncio
@@ -94,11 +96,14 @@ async def test_retry_foreign_worker_stays_404_even_with_query():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
 
-    class Store:
+    class Projection:
         def get_worker(self, _parent, _worker_id):
-            raise DurableWorkerAuthorizationError("foreign worker")
+            raise NotFoundError("foreign worker")
 
-    adapter._durable_worker_store = lambda: Store()
+    adapter._durable_worker_projection = lambda: Projection()
+    adapter._durable_worker_store = lambda: (_ for _ in ()).throw(
+        AssertionError("foreign query must not construct the mutable store")
+    )
     adapter._read_json_body = lambda _request: (_ for _ in ()).throw(
         AssertionError("foreign worker must fail before body read")
     )
@@ -111,28 +116,26 @@ async def test_retry_foreign_worker_stays_404_even_with_query():
 
 
 @pytest.mark.asyncio
-async def test_cancel_checks_activation_ownership_then_rejects_query_before_body_or_lifecycle():
+async def test_cancel_checks_read_only_worker_ownership_then_rejects_query():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
     sequence = []
 
-    class Control:
-        def get_activation(self, parent, worker_id, activation_id):
-            sequence.append(("ownership", parent, worker_id, activation_id))
-            return {
-                "activation_id": activation_id,
-                "worker_id": worker_id,
-                "subagent_id": "sa-1",
-                "state": "RUNNING",
-            }
-
-        def request_cancel(self, *_args, **_kwargs):
-            raise AssertionError("cancel query must be rejected before mutation")
+    class Projection:
+        def get_worker(self, parent, worker_id):
+            sequence.append(("projection", parent, worker_id))
+            return {"worker_id": worker_id, "parent_session_id": parent}
 
     async def _unexpected_body(_request):
         raise AssertionError("cancel query must be rejected before body read")
 
-    adapter._durable_worker_control = lambda: Control()
+    adapter._durable_worker_projection = lambda: Projection()
+    adapter._durable_worker_store = lambda: (_ for _ in ()).throw(
+        AssertionError("invalid query must not construct the mutable store")
+    )
+    adapter._durable_worker_control = lambda: (_ for _ in ()).throw(
+        AssertionError("cancel query must be rejected before control/lifecycle lookup")
+    )
     adapter._read_json_body = _unexpected_body
     request = SimpleNamespace(
         query_string="debug=1",
@@ -140,21 +143,27 @@ async def test_cancel_checks_activation_ownership_then_rejects_query_before_body
     )
     response = await adapter._handle_dw_cancel_activation(request)
     _assert_invalid_query(response)
-    assert sequence == [("ownership", "session-1", "dw-1", "dwa-1")]
+    assert sequence == [("projection", "session-1", "dw-1")]
 
 
 @pytest.mark.asyncio
-async def test_cancel_foreign_activation_stays_404_even_with_query():
+async def test_cancel_foreign_worker_stays_404_even_with_query():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
 
-    class Control:
-        def get_activation(self, _parent, _worker_id, _activation_id):
-            raise DurableWorkerAuthorizationError("foreign activation")
+    class Projection:
+        def get_worker(self, _parent, _worker_id):
+            raise NotFoundError("foreign worker")
 
-    adapter._durable_worker_control = lambda: Control()
+    adapter._durable_worker_projection = lambda: Projection()
+    adapter._durable_worker_store = lambda: (_ for _ in ()).throw(
+        AssertionError("foreign query must not construct the mutable store")
+    )
+    adapter._durable_worker_control = lambda: (_ for _ in ()).throw(
+        AssertionError("foreign worker must fail before control lookup")
+    )
     adapter._read_json_body = lambda _request: (_ for _ in ()).throw(
-        AssertionError("foreign activation must fail before body read")
+        AssertionError("foreign worker must fail before body read")
     )
     request = SimpleNamespace(
         query_string="debug=1",

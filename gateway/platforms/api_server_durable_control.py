@@ -9,7 +9,6 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from agent.durable_worker_control import DurableWorkerControl
-from agent.durable_workers import DurableWorkerError
 from gateway.platforms.api_server import _openai_error, web
 from gateway.platforms.api_server_durable_runtime import (
     DurableWorkersRuntimeAPIServerAdapter,

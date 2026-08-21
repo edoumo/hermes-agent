@@ -54,8 +54,12 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
         H4 deliberately defines exact path/body contracts. Query parameters are
         not an extension point: accepting and silently ignoring them makes the
         control surface ambiguous and lets callers believe unsupported options
-        were honored. Session authorization is checked before this guard so a
-        foreign/nonexistent session still fails closed with the existing 404.
+        were honored.
+
+        Handlers apply this guard only after the narrowest available ownership
+        lookup.  That preserves the existing fail-closed 404 for foreign objects
+        while still rejecting unsupported query parameters before body parsing,
+        lifecycle access or durable mutation.
         """
         raw_query = str(getattr(request, "query_string", "") or "")
         if not raw_query:
@@ -96,10 +100,19 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
         session_id, _session, err = await self._dw_session_or_error(request)
         if err:
             return err
+        worker_id = str(request.match_info.get("worker_id") or "").strip()
+
+        # Preserve fail-closed object ownership before validating the request
+        # contract.  This is read-only and must happen before a foreign worker
+        # can be distinguished by a 400 query-contract response.
+        try:
+            self._durable_worker_store().get_worker(session_id, worker_id)
+        except Exception as exc:
+            return self._dw_error_response(exc)
+
         query_error = self._dw_control_query_error(request)
         if query_error:
             return query_error
-        worker_id = str(request.match_info.get("worker_id") or "").strip()
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -141,11 +154,21 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
         session_id, _session, err = await self._dw_session_or_error(request)
         if err:
             return err
+        worker_id = str(request.match_info.get("worker_id") or "").strip()
+        activation_id = str(request.match_info.get("activation_id") or "").strip()
+        control = self._durable_worker_control()
+
+        # Activation lookup proves both worker and activation ownership before
+        # query validation.  It is read-only; lifecycle handles and mutation are
+        # deliberately not touched until after the query/body contract passes.
+        try:
+            activation = control.get_activation(session_id, worker_id, activation_id)
+        except Exception as exc:
+            return self._dw_error_response(exc)
+
         query_error = self._dw_control_query_error(request)
         if query_error:
             return query_error
-        worker_id = str(request.match_info.get("worker_id") or "").strip()
-        activation_id = str(request.match_info.get("activation_id") or "").strip()
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -177,12 +200,6 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
                 ),
                 status=400,
             )
-
-        control = self._durable_worker_control()
-        try:
-            activation = control.get_activation(session_id, worker_id, activation_id)
-        except Exception as exc:
-            return self._dw_error_response(exc)
 
         state = str(activation.get("state") or "")
         if state == "CANCEL_REQUESTED":

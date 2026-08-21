@@ -1,12 +1,12 @@
-"""Opt-in H4 extension of Hermes' built-in API server platform."""
+"""Opt-in H5 extension of Hermes' built-in API server platform."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from gateway.platforms.api_server import AIOHTTP_AVAILABLE, APIServerAdapter
-from gateway.platforms.api_server_durable_control import (
-    DurableWorkersControlAPIServerAdapter,
+from gateway.platforms.api_server_durable_orchestration import (
+    DurableWorkersTaskOrchestrationAPIServerAdapter,
 )
 
 
@@ -21,10 +21,10 @@ def _enabled(value: Any) -> bool:
 
 
 def _factory(config):
-    """Return the stock adapter unless Durable Workers API is explicitly opted in."""
+    """Return stock API server unless Durable Workers API is explicitly opted in."""
     extra = getattr(config, "extra", {}) or {}
     if _enabled(extra.get("durable_workers_api")):
-        return DurableWorkersControlAPIServerAdapter(config)
+        return DurableWorkersTaskOrchestrationAPIServerAdapter(config)
     return APIServerAdapter(config)
 
 

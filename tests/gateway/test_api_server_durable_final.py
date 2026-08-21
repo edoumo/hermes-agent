@@ -38,15 +38,17 @@ def test_final_adapter_adds_no_routes_or_listener():
     assert "_check_auth" not in DurableWorkersFinalAPIServerAdapter.__dict__
 
 
-def test_final_adapter_uses_versioned_store(monkeypatch, tmp_path):
+def test_final_adapter_uses_and_caches_versioned_store(monkeypatch, tmp_path):
     path = tmp_path / "durable-workers.db"
     adapter = object.__new__(DurableWorkersFinalAPIServerAdapter)
     monkeypatch.setattr(adapter, "_durable_worker_db_path", lambda: path)
 
-    store = adapter._durable_worker_store()
+    first = adapter._durable_worker_store()
+    second = adapter._durable_worker_store()
 
-    assert isinstance(store, VersionedDurableWorkerStore)
-    assert store.db_path == Path(path)
+    assert isinstance(first, VersionedDurableWorkerStore)
+    assert first.db_path == Path(path)
+    assert second is first
 
 
 def test_final_adapter_preflights_storage_during_construction(monkeypatch, tmp_path):
@@ -65,6 +67,8 @@ def test_final_adapter_preflights_storage_during_construction(monkeypatch, tmp_p
     adapter = DurableWorkersFinalAPIServerAdapter(object())
 
     assert adapter._dw_storage_schema_version == DURABLE_SCHEMA_VERSION
+    assert isinstance(adapter._dw_versioned_store, VersionedDurableWorkerStore)
+    assert adapter._durable_worker_store() is adapter._dw_versioned_store
     with sqlite3.connect(path) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 1
 

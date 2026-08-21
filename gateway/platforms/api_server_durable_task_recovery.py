@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
+from agent.durable_task_public_graph import PublicDurableTaskGraphProjection
 from agent.durable_task_recovery import RecoverableDurableTaskOrchestrator
 from gateway.platforms.api_server import _api_request_profile, _openai_error, web
 from gateway.platforms.api_server_durable_orchestration import (
@@ -37,6 +38,9 @@ class DurableWorkersTaskRecoveryAPIServerAdapter(
         if self._durable_worker_db_path().exists():
             store = self._durable_worker_store()
             RecoverableDurableTaskOrchestrator(store)
+
+    def _durable_task_graph_projection(self) -> PublicDurableTaskGraphProjection:
+        return PublicDurableTaskGraphProjection(self._durable_worker_db_path())
 
     def _http_route_table(self) -> list[tuple]:
         routes = list(super()._http_route_table())

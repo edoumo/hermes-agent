@@ -1,7 +1,7 @@
 name: api-server-durable-workers
 label: API Server Durable Workers
 kind: platform
-version: 0.3.0
+version: 0.3.1
 description: >
   Experimental H4 extension for the built-in Hermes API server. The platform
   factory preserves the stock APIServerAdapter unless
@@ -12,6 +12,7 @@ description: >
   retry of terminal failed workers and cancellation of locally supervised
   activations. Cancellation remains fail-closed: durable intent is persisted
   before lifecycle interruption, and a worker is released only after terminal
-  CANCELLED is observed. The extension reuses the existing Hermes listener,
+  CANCELLED is observed. H4 control routes use exact path/body contracts and
+  reject query parameters. The extension reuses the existing Hermes listener,
   bearer authentication, CORS and profile scope.
 author: MITC

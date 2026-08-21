@@ -1,4 +1,4 @@
-"""H5 platform-factory tests for the opt-in Durable Workers API server."""
+"""H6 platform-factory tests for the opt-in Durable Workers API server."""
 
 from types import SimpleNamespace
 
@@ -9,18 +9,18 @@ def test_factory_keeps_stock_api_server_by_default(monkeypatch):
     monkeypatch.setattr(plugin, "APIServerAdapter", lambda cfg: ("stock", cfg))
     monkeypatch.setattr(
         plugin,
-        "DurableWorkersTaskRecoveryAPIServerAdapter",
+        "DurableWorkersFinalAPIServerAdapter",
         lambda cfg: ("durable", cfg),
     )
     cfg = SimpleNamespace(extra={})
     assert plugin._factory(cfg)[0] == "stock"
 
 
-def test_factory_requires_explicit_h5_opt_in(monkeypatch):
+def test_factory_requires_explicit_h6_opt_in(monkeypatch):
     monkeypatch.setattr(plugin, "APIServerAdapter", lambda cfg: ("stock", cfg))
     monkeypatch.setattr(
         plugin,
-        "DurableWorkersTaskRecoveryAPIServerAdapter",
+        "DurableWorkersFinalAPIServerAdapter",
         lambda cfg: ("durable", cfg),
     )
     for enabled in (True, "true", "1", "yes", "on", 1):

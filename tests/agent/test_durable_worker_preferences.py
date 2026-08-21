@@ -96,10 +96,35 @@ def test_running_worker_cannot_be_edited_or_archived(tmp_path):
             model="model-c",
         )
 
-    with pytest.raises(DurableWorkerConflictError, match="running durable worker"):
+    with pytest.raises(DurableWorkerConflictError, match="only a dormant"):
         store.set_worker_archived(
             "session-1",
             worker["worker_id"],
             archived=True,
             expected_revision=running["revision"],
+        )
+
+
+def test_failed_worker_cannot_be_archived_to_bypass_retry_recovery(tmp_path):
+    store, worker = _worker(tmp_path)
+    store.enqueue_message("session-1", worker["worker_id"], "run")
+    reserved = store.reserve_next_activation("session-1", worker["worker_id"])
+    store.finish_activation(
+        "session-1",
+        worker["worker_id"],
+        reserved["activation_id"],
+        reserved["message"]["message_id"],
+        state="FAILED",
+        error="boom",
+        message_state="FAILED",
+        worker_state="FAILED",
+    )
+    failed = store.get_worker("session-1", worker["worker_id"])
+
+    with pytest.raises(DurableWorkerConflictError, match="only a dormant"):
+        store.set_worker_archived(
+            "session-1",
+            worker["worker_id"],
+            archived=True,
+            expected_revision=failed["revision"],
         )

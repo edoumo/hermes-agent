@@ -9,7 +9,7 @@ def test_factory_keeps_stock_api_server_by_default(monkeypatch):
     monkeypatch.setattr(plugin, "APIServerAdapter", lambda cfg: ("stock", cfg))
     monkeypatch.setattr(
         plugin,
-        "DurableWorkersTaskOrchestrationAPIServerAdapter",
+        "DurableWorkersTaskRecoveryAPIServerAdapter",
         lambda cfg: ("durable", cfg),
     )
     cfg = SimpleNamespace(extra={})
@@ -20,7 +20,7 @@ def test_factory_requires_explicit_h5_opt_in(monkeypatch):
     monkeypatch.setattr(plugin, "APIServerAdapter", lambda cfg: ("stock", cfg))
     monkeypatch.setattr(
         plugin,
-        "DurableWorkersTaskOrchestrationAPIServerAdapter",
+        "DurableWorkersTaskRecoveryAPIServerAdapter",
         lambda cfg: ("durable", cfg),
     )
     for enabled in (True, "true", "1", "yes", "on", 1):

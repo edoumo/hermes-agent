@@ -1,6 +1,7 @@
 """H6 contract tests for the opt-in Durable Workers tool plugin."""
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -45,10 +46,16 @@ def test_tool_plugin_preserves_h1_action_surface():
 
 def test_tool_plugin_uses_h6_versioned_store():
     source = PLUGIN.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    called_names = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
 
     assert "from agent.versioned_durable_workers import VersionedDurableWorkerStore" in source
-    assert "store = VersionedDurableWorkerStore()" in source
-    assert "DurableWorkerStore(" not in source
+    assert "VersionedDurableWorkerStore" in called_names
+    assert "DurableWorkerStore" not in called_names
 
 
 def test_tool_plugin_metadata_marks_h6_storage_revision():

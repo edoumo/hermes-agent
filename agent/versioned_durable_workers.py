@@ -14,14 +14,22 @@ from agent.durable_worker_schema import (
     ensure_current_schema,
     refuse_future_schema,
 )
-from agent.durable_workers import DurableWorkerStore, _default_path
+from agent.durable_workers import DurableWorkerStore
+
+
+def _default_durable_worker_db_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "durable-workers.db"
 
 
 class VersionedDurableWorkerStore(DurableWorkerStore):
     """DurableWorkerStore with H6 schema compatibility guarantees."""
 
     def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = Path(db_path) if db_path else _default_path()
+        self.db_path = (
+            Path(db_path) if db_path else _default_durable_worker_db_path()
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         # This read-only guard must happen before inherited schema bootstrap.

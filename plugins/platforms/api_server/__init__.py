@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from gateway.platforms.api_server import AIOHTTP_AVAILABLE, APIServerAdapter
-from gateway.platforms.api_server_durable_orchestration import (
-    DurableWorkersTaskOrchestrationAPIServerAdapter,
+from gateway.platforms.api_server_durable_task_recovery import (
+    DurableWorkersTaskRecoveryAPIServerAdapter,
 )
 
 
@@ -24,7 +24,7 @@ def _factory(config):
     """Return stock API server unless Durable Workers API is explicitly opted in."""
     extra = getattr(config, "extra", {}) or {}
     if _enabled(extra.get("durable_workers_api")):
-        return DurableWorkersTaskOrchestrationAPIServerAdapter(config)
+        return DurableWorkersTaskRecoveryAPIServerAdapter(config)
     return APIServerAdapter(config)
 
 

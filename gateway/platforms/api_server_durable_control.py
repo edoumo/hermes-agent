@@ -56,10 +56,10 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
         control surface ambiguous and lets callers believe unsupported options
         were honored.
 
-        Handlers apply this guard only after the narrowest available ownership
-        lookup.  That preserves the existing fail-closed 404 for foreign objects
-        while still rejecting unsupported query parameters before body parsing,
-        lifecycle access or durable mutation.
+        Handlers apply this guard only after the narrowest read-only ownership
+        lookup available. That preserves the existing fail-closed 404 for a
+        foreign worker while still rejecting unsupported query parameters before
+        body parsing, lifecycle access or durable mutation.
         """
         raw_query = str(getattr(request, "query_string", "") or "")
         if not raw_query:
@@ -102,11 +102,12 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
             return err
         worker_id = str(request.match_info.get("worker_id") or "").strip()
 
-        # Preserve fail-closed object ownership before validating the request
-        # contract.  This is read-only and must happen before a foreign worker
-        # can be distinguished by a 400 query-contract response.
+        # The H2 projection opens SQLite in mode=ro with query_only enabled.
+        # Use it to preserve worker-ownership 404 semantics without constructing
+        # DurableWorkerStore, whose initialization may run abandoned-work
+        # recovery and therefore is inappropriate for an invalid query request.
         try:
-            self._durable_worker_store().get_worker(session_id, worker_id)
+            self._durable_worker_projection().get_worker(session_id, worker_id)
         except Exception as exc:
             return self._dw_error_response(exc)
 
@@ -156,13 +157,12 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
             return err
         worker_id = str(request.match_info.get("worker_id") or "").strip()
         activation_id = str(request.match_info.get("activation_id") or "").strip()
-        control = self._durable_worker_control()
 
-        # Activation lookup proves both worker and activation ownership before
-        # query validation.  It is read-only; lifecycle handles and mutation are
-        # deliberately not touched until after the query/body contract passes.
+        # Preserve the same worker-level fail-closed ordering as retry using the
+        # read-only H2 projection. Exact activation lookup remains below the
+        # request-contract guard and is reached only for a valid no-query call.
         try:
-            activation = control.get_activation(session_id, worker_id, activation_id)
+            self._durable_worker_projection().get_worker(session_id, worker_id)
         except Exception as exc:
             return self._dw_error_response(exc)
 
@@ -200,6 +200,12 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
                 ),
                 status=400,
             )
+
+        control = self._durable_worker_control()
+        try:
+            activation = control.get_activation(session_id, worker_id, activation_id)
+        except Exception as exc:
+            return self._dw_error_response(exc)
 
         state = str(activation.get("state") or "")
         if state == "CANCEL_REQUESTED":

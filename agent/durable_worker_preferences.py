@@ -1,10 +1,10 @@
 """H6.1 operator preferences for durable workers.
 
 The H6 durable schema already carries editable presentation/runtime fields and a
-DISABLED state.  This module exposes those capabilities without weakening the
-durable-history contract: operators may change a dormant worker's label/model/
-toolsets and archive or restore an identity, but no worker transcript,
-activation, task, or audit row is deleted.
+DISABLED state. This module exposes those capabilities without weakening the
+durable-history contract: operators may change safe worker preferences and
+archive or restore a dormant identity, but no worker transcript, activation,
+task, or audit row is deleted.
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class ManagedVersionedDurableWorkerStore(VersionedDurableWorkerStore):
         """Update safe worker preferences with revision CAS.
 
         Runtime-affecting preferences cannot be changed while the worker is
-        RUNNING.  ``model=None`` explicitly clears the override and returns the
+        RUNNING. ``model=None`` explicitly clears the override and returns the
         worker to the gateway-default model.
         """
 
@@ -127,7 +127,12 @@ class ManagedVersionedDurableWorkerStore(VersionedDurableWorkerStore):
         archived: bool,
         expected_revision: int,
     ) -> dict[str, Any]:
-        """Archive or restore a worker without deleting durable history."""
+        """Archive or restore a worker without deleting durable history.
+
+        Archiving is deliberately restricted to DORMANT workers. In particular,
+        a FAILED worker cannot be archived and restored as a shortcut around
+        the qualified retry/recovery path.
+        """
 
         expected = self._expected_revision(expected_revision)
         target = "DISABLED" if archived else "DORMANT"
@@ -136,17 +141,18 @@ class ManagedVersionedDurableWorkerStore(VersionedDurableWorkerStore):
             worker = self._owned_worker(db, parent, worker_id)
             if int(worker["revision"]) != expected:
                 raise DurableWorkerConflictError("durable worker revision conflict")
-            if worker["status"] == "RUNNING":
-                raise DurableWorkerConflictError(
-                    "cannot archive or restore a running durable worker"
-                )
-            if not archived and worker["status"] != "DISABLED":
+            if archived:
+                if worker["status"] == "DISABLED":
+                    db.commit()
+                    return self._worker(worker)
+                if worker["status"] != "DORMANT":
+                    raise DurableWorkerConflictError(
+                        "only a dormant durable worker can be archived"
+                    )
+            elif worker["status"] != "DISABLED":
                 raise DurableWorkerConflictError(
                     "only an archived durable worker can be restored"
                 )
-            if worker["status"] == target:
-                db.commit()
-                return self._worker(worker)
 
             updated = db.execute(
                 "UPDATE durable_workers "

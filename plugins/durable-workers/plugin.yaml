@@ -1,0 +1,4 @@
+name: durable-workers
+version: "0.2.0"
+description: "Experimental Durable Worker tool surface with persistent inbox, activation history, task dependencies, cold reactivation, and H6 versioned storage. Opt-in only."
+author: "MITC / Edwige"

@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+from agent.durable_task_orchestration import DurableTaskOrchestrator
 from agent.durable_worker_schema import (
     DURABLE_SCHEMA_VERSION,
     DurableWorkerSchemaError,
@@ -47,11 +48,15 @@ def test_new_versioned_store_creates_formal_v1_layout(tmp_path):
     assert audit.foreign_key_violations == ()
 
 
-def test_legacy_unversioned_h1_h5_database_is_adopted_without_data_loss(tmp_path):
+def test_legacy_unversioned_core_database_is_adopted_without_data_loss(tmp_path):
     path = tmp_path / "durable-workers.db"
     legacy = DurableWorkerStore(path)
     worker = legacy.create_worker("session-1", label="legacy-worker")
-    message = legacy.enqueue_message("session-1", worker["worker_id"], "legacy-message")
+    message = legacy.enqueue_message(
+        "session-1",
+        worker["worker_id"],
+        "legacy-message",
+    )
     task = legacy.create_task(
         "session-1",
         subject="legacy-task",
@@ -64,10 +69,55 @@ def test_legacy_unversioned_h1_h5_database_is_adopted_without_data_loss(tmp_path
     adopted = VersionedDurableWorkerStore(path)
 
     assert _user_version(path) == 1
-    assert adopted.get_worker("session-1", worker["worker_id"])["label"] == "legacy-worker"
-    assert adopted.list_messages("session-1", worker["worker_id"])[0]["message_id"] == message["message_id"]
+    assert (
+        adopted.get_worker("session-1", worker["worker_id"])["label"]
+        == "legacy-worker"
+    )
+    assert (
+        adopted.list_messages("session-1", worker["worker_id"])[0]["message_id"]
+        == message["message_id"]
+    )
     assert adopted.get_task("session-1", task["task_id"])["subject"] == "legacy-task"
     assert "durable_worker_task_runs" in _tables(path)
+    assert audit_schema(path).ok is True
+
+
+def test_real_unversioned_h5_task_run_layout_is_adopted_in_place(tmp_path):
+    path = tmp_path / "durable-workers.db"
+    legacy = DurableWorkerStore(path)
+    worker = legacy.create_worker("session-1", label="h5-worker")
+    task = legacy.create_task(
+        "session-1",
+        subject="h5-task",
+        worker_id=worker["worker_id"],
+    )
+    orchestrator = DurableTaskOrchestrator(legacy)
+    reserved = orchestrator.reserve_ready_task(
+        "session-1",
+        task["task_id"],
+        expected_revision=task["revision"],
+    )
+
+    assert _user_version(path) == 0
+    assert "durable_worker_task_runs" in _tables(path)
+    with sqlite3.connect(path) as db:
+        before = db.execute(
+            "SELECT task_id,message_id,worker_id,state "
+            "FROM durable_worker_task_runs WHERE activation_id=?",
+            (reserved["activation_id"],),
+        ).fetchone()
+
+    adopted = VersionedDurableWorkerStore(path)
+
+    assert _user_version(path) == 1
+    with sqlite3.connect(path) as db:
+        after = db.execute(
+            "SELECT task_id,message_id,worker_id,state "
+            "FROM durable_worker_task_runs WHERE activation_id=?",
+            (reserved["activation_id"],),
+        ).fetchone()
+    assert after == before
+    assert adopted.get_task("session-1", task["task_id"])["status"] == "in_progress"
     assert audit_schema(path).ok is True
 
 
@@ -89,6 +139,26 @@ def test_future_schema_is_rejected_before_h1_bootstrap_mutates_database(tmp_path
         assert db.execute("SELECT marker FROM future_only").fetchone()[0] == "keep-me"
 
 
+def test_failed_legacy_adoption_does_not_stamp_schema_version(tmp_path):
+    path = tmp_path / "durable-workers.db"
+    legacy = DurableWorkerStore(path)
+    worker = legacy.create_worker("session-1", label="worker")
+
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute(
+            "INSERT INTO durable_worker_messages "
+            "(message_id,worker_id,direction,content,state,created_at,updated_at) "
+            "VALUES('bad-message','missing-worker','parent','x','PENDING',1,1)"
+        )
+
+    with pytest.raises(DurableWorkerSchemaError, match="foreign-key violations"):
+        VersionedDurableWorkerStore(path)
+
+    assert _user_version(path) == 0
+    assert legacy.get_worker("session-1", worker["worker_id"])["label"] == "worker"
+
+
 def test_audit_detects_foreign_key_violation_without_repairing_it(tmp_path):
     path = tmp_path / "durable-workers.db"
     VersionedDurableWorkerStore(path)
@@ -108,7 +178,8 @@ def test_audit_detects_foreign_key_violation_without_repairing_it(tmp_path):
 
     with sqlite3.connect(path) as db:
         assert db.execute(
-            "SELECT COUNT(*) FROM durable_worker_messages WHERE message_id='bad-message'"
+            "SELECT COUNT(*) FROM durable_worker_messages "
+            "WHERE message_id='bad-message'"
         ).fetchone()[0] == 1
 
 
@@ -116,12 +187,22 @@ def test_h5_store_can_reopen_h6_v1_database_for_rollback(tmp_path):
     path = tmp_path / "durable-workers.db"
     h6 = VersionedDurableWorkerStore(path)
     worker = h6.create_worker("session-1", label="rollback-worker")
-    h6.enqueue_message("session-1", worker["worker_id"], "rollback-message")
+    h6.enqueue_message(
+        "session-1",
+        worker["worker_id"],
+        "rollback-message",
+    )
 
     # H5 code ignores PRAGMA user_version. Because H6 v1 is deliberately the
     # H5 layout, reverting the executable does not require a database downgrade.
     h5 = DurableWorkerStore(path)
 
-    assert h5.get_worker("session-1", worker["worker_id"])["label"] == "rollback-worker"
-    assert h5.list_messages("session-1", worker["worker_id"])[0]["content"] == "rollback-message"
+    assert (
+        h5.get_worker("session-1", worker["worker_id"])["label"]
+        == "rollback-worker"
+    )
+    assert (
+        h5.list_messages("session-1", worker["worker_id"])[0]["content"]
+        == "rollback-message"
+    )
     assert _user_version(path) == DURABLE_SCHEMA_VERSION

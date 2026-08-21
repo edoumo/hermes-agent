@@ -1,17 +1,16 @@
 name: api-server-durable-workers
 label: API Server Durable Workers
 kind: platform
-version: 0.5.0
+version: 0.6.0
 description: >
-  Experimental H6 final-consolidation extension for the built-in Hermes API
+  Experimental H6.1 Durable Workers extension for the built-in Hermes API
   server. The platform factory preserves the stock APIServerAdapter unless
   platforms.api_server.extra.durable_workers_api is explicitly enabled. When
   enabled, the qualified H2.1/H4/H5 Durable Worker read, write, activation,
   SSE, operational recovery and task-DAG orchestration surfaces remain
-  available. H6 adds no routes or listeners; it formalizes the already
-  qualified H5 SQLite layout as schema version 1, adopts legacy unversioned
-  databases non-destructively, rejects future schema versions before mutation,
-  and provides explicit structural/foreign-key/quick-check auditing. Live
-  lifecycle handles remain transient and the extension reuses Hermes bearer
-  authentication, CORS and profile scope.
+  available. H6 formalizes the already qualified H5 SQLite layout as schema
+  version 1; H6.1 adds only reversible operator controls for worker preference
+  editing and archive/restore. Durable history is never hard-deleted by these
+  controls. Live lifecycle handles remain transient and the extension reuses
+  Hermes bearer authentication, CORS and profile scope.
 author: MITC

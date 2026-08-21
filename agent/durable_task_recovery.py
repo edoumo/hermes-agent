@@ -1,9 +1,9 @@
-"""H5 retry/cancel recovery for Durable Task orchestration.
+"""H5 retry/cancel/crash recovery for Durable Task orchestration.
 
 A task-dispatched durable message must remain associated with the task when H4
-requeues it after operator cancellation or when an operator recovers a failed
-worker. This layer extends the base H5 orchestrator so redispatch reuses that
-same task message while creating a fresh activation id.
+requeues it after operator cancellation, after a failed-worker recovery, or
+after process-boundary recovery. This layer extends the base H5 orchestrator so
+redispatch reuses that same task message while creating a fresh activation id.
 """
 from __future__ import annotations
 
@@ -20,7 +20,96 @@ from agent.durable_workers import (
 
 
 class RecoverableDurableTaskOrchestrator(DurableTaskOrchestrator):
-    """H5 orchestrator with task-aware failed recovery and message reuse."""
+    """H5 orchestrator with task-aware failed/crash recovery and message reuse."""
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.recover_task_runs()
+
+    def recover_task_runs(self) -> int:
+        """Align stale in-progress tasks with already-durable H1/H4 terminal state.
+
+        DurableWorkerStore is constructed before this orchestrator, so H1 has
+        already converted dead-owner activations to ABANDONED and restored the
+        worker/message pair. H5 never guesses from process state here; it only
+        projects those persisted states back onto the latest task run.
+        """
+        recovered = 0
+        db = self.store._db()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT r.activation_id,r.task_id,r.message_id,r.worker_id,"
+                "a.state AS activation_state,a.completed_at AS activation_completed_at,"
+                "a.summary AS activation_summary,a.error AS activation_error,"
+                "m.state AS message_state,w.status AS worker_status,t.parent_session_id "
+                "FROM durable_worker_task_runs r "
+                "JOIN durable_worker_tasks t ON t.task_id=r.task_id "
+                "JOIN durable_worker_activations a ON a.activation_id=r.activation_id "
+                "JOIN durable_worker_messages m ON m.message_id=r.message_id "
+                "JOIN durable_workers w ON w.worker_id=r.worker_id "
+                "WHERE t.status='in_progress'"
+            ).fetchall()
+            for row in rows:
+                state = str(row["activation_state"] or "")
+                if state in {"STARTING", "RUNNING", "CANCEL_REQUESTED"}:
+                    continue
+                latest = db.execute(
+                    "SELECT activation_id FROM durable_worker_task_runs "
+                    "WHERE task_id=? ORDER BY created_at DESC,activation_id DESC LIMIT 1",
+                    (row["task_id"],),
+                ).fetchone()
+                if latest is None or latest["activation_id"] != row["activation_id"]:
+                    continue
+
+                message_state = str(row["message_state"] or "")
+                worker_state = str(row["worker_status"] or "")
+                target = None
+                if (
+                    state == "SUCCEEDED"
+                    and message_state == "CONSUMED"
+                    and worker_state == "DORMANT"
+                ):
+                    target = "completed"
+                elif (
+                    state in {"FAILED_TO_START", "ABANDONED", "CANCELLED"}
+                    and message_state == "PENDING"
+                    and worker_state == "DORMANT"
+                ):
+                    target = "pending"
+                elif (
+                    message_state == "FAILED"
+                    or worker_state == "FAILED"
+                    or state in {"FAILED", "INTERRUPTED", "CANCELLED"}
+                ):
+                    target = "failed"
+                if target is None:
+                    continue
+
+                db.execute(
+                    "UPDATE durable_worker_task_runs SET state=?,completed_at=?,summary=?,error=? "
+                    "WHERE activation_id=?",
+                    (
+                        state,
+                        row["activation_completed_at"],
+                        row["activation_summary"],
+                        row["activation_error"],
+                        row["activation_id"],
+                    ),
+                )
+                updated = db.execute(
+                    "UPDATE durable_worker_tasks SET status=?,revision=revision+1,updated_at=? "
+                    "WHERE task_id=? AND parent_session_id=? AND status='in_progress'",
+                    (target, _now(), row["task_id"], row["parent_session_id"]),
+                ).rowcount
+                recovered += int(updated == 1)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return recovered
 
     def recover_failed_task(
         self,
@@ -69,7 +158,6 @@ class RecoverableDurableTaskOrchestrator(DurableTaskOrchestrator):
             if message is None:
                 raise DurableWorkerConflictError("failed task message is missing")
 
-            # Native H5 recovery path: failed worker/message are restored here.
             if worker["status"] == "FAILED" and message["state"] == "FAILED":
                 now = _now()
                 db.execute(
@@ -83,7 +171,6 @@ class RecoverableDurableTaskOrchestrator(DurableTaskOrchestrator):
                     "AND status='FAILED'",
                     (now, run["worker_id"], parent),
                 )
-            # Interop path: H4 worker retry may already have restored the pair.
             elif not (
                 worker["status"] == "DORMANT" and message["state"] == "PENDING"
             ):

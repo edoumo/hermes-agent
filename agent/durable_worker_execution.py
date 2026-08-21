@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from agent.durable_worker_control import DurableWorkerControl
 from agent.durable_workers import (
     DurableWorkerAuthorizationError,
     DurableWorkerConflictError,
@@ -161,6 +162,39 @@ def execute_reserved_activation(
             "summary": text,
             "report_message_id": report["message_id"] if report else None,
         }
+
+    # H4 distinguishes a completed operator cancellation from a generic child
+    # failure.  The durable CANCEL_REQUESTED state proves an operator control
+    # path marked this activation before lifecycle terminality.  Only after the
+    # child is confirmed CANCELLED do we release the worker and requeue its
+    # message. Gateway drain does not set this durable marker, so it keeps the
+    # older fail-closed FAILED behavior.
+    if state == "CANCELLED":
+        try:
+            operator_cancel = DurableWorkerControl(store).is_cancel_requested(
+                parent, worker_id, activation_id
+            )
+        except Exception:
+            operator_cancel = False
+        if operator_cancel:
+            error_text = str(error or "operator cancellation completed")[:32000]
+            store.finish_activation(
+                parent,
+                worker_id,
+                activation_id,
+                message_id,
+                state="CANCELLED",
+                error=error_text,
+                message_state="PENDING",
+                worker_state="DORMANT",
+            )
+            return {
+                "worker_id": worker_id,
+                "activation_id": activation_id,
+                "subagent_id": handle.subagent_id,
+                "status": "CANCELLED",
+                "retryable": True,
+            }
 
     error_text = str(error or state or "activation failed")[:32000]
     store.finish_activation(

@@ -1,4 +1,4 @@
-"""H6 final API adapter contract tests."""
+"""H6/H6.1 final API adapter contract tests."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+from agent.durable_worker_preferences import ManagedVersionedDurableWorkerStore
 from agent.durable_worker_schema import (
     DURABLE_SCHEMA_VERSION,
     DurableWorkerSchemaError,
@@ -19,7 +20,14 @@ from gateway.platforms.api_server_durable_task_recovery import (
 )
 
 
-def test_final_adapter_adds_no_routes_or_listener():
+_H61_ROUTES = {
+    ("POST", "/api/sessions/{session_id}/workers/{worker_id}/edit"),
+    ("POST", "/api/sessions/{session_id}/workers/{worker_id}/archive"),
+    ("POST", "/api/sessions/{session_id}/workers/{worker_id}/restore"),
+}
+
+
+def test_final_adapter_adds_only_reversible_h61_routes_and_no_listener():
     adapter = object.__new__(DurableWorkersFinalAPIServerAdapter)
     inherited = object.__new__(DurableWorkersTaskRecoveryAPIServerAdapter)
 
@@ -32,13 +40,15 @@ def test_final_adapter_adds_no_routes_or_listener():
         for method, path, _handler in inherited._http_route_table()
     ]
 
-    assert final_routes == inherited_routes
+    assert set(final_routes) - set(inherited_routes) == _H61_ROUTES
+    assert len(final_routes) == len(inherited_routes) + len(_H61_ROUTES)
     assert len(final_routes) == len(set(final_routes))
+    assert all(method == "POST" for method, _path in _H61_ROUTES)
     assert "connect" not in DurableWorkersFinalAPIServerAdapter.__dict__
     assert "_check_auth" not in DurableWorkersFinalAPIServerAdapter.__dict__
 
 
-def test_final_adapter_uses_and_caches_versioned_store(monkeypatch, tmp_path):
+def test_final_adapter_uses_and_caches_managed_versioned_store(monkeypatch, tmp_path):
     path = tmp_path / "durable-workers.db"
     adapter = object.__new__(DurableWorkersFinalAPIServerAdapter)
     monkeypatch.setattr(adapter, "_durable_worker_db_path", lambda: path)
@@ -46,6 +56,7 @@ def test_final_adapter_uses_and_caches_versioned_store(monkeypatch, tmp_path):
     first = adapter._durable_worker_store()
     second = adapter._durable_worker_store()
 
+    assert isinstance(first, ManagedVersionedDurableWorkerStore)
     assert isinstance(first, VersionedDurableWorkerStore)
     assert first.db_path == Path(path)
     assert second is first
@@ -67,6 +78,7 @@ def test_final_adapter_preflights_storage_during_construction(monkeypatch, tmp_p
     adapter = DurableWorkersFinalAPIServerAdapter(object())
 
     assert adapter._dw_storage_schema_version == DURABLE_SCHEMA_VERSION
+    assert isinstance(adapter._dw_versioned_store, ManagedVersionedDurableWorkerStore)
     assert isinstance(adapter._dw_versioned_store, VersionedDurableWorkerStore)
     assert adapter._durable_worker_store() is adapter._dw_versioned_store
     with sqlite3.connect(path) as db:

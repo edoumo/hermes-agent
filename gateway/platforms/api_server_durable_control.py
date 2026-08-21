@@ -47,10 +47,38 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
     def _durable_worker_control(self) -> DurableWorkerControl:
         return DurableWorkerControl(self._durable_worker_store())
 
+    @staticmethod
+    def _dw_control_query_error(request: "web.Request") -> Optional["web.Response"]:
+        """Reject every query string on H4 control routes.
+
+        H4 deliberately defines exact path/body contracts. Query parameters are
+        not an extension point: accepting and silently ignoring them makes the
+        control surface ambiguous and lets callers believe unsupported options
+        were honored. Session authorization is checked before this guard so a
+        foreign/nonexistent session still fails closed with the existing 404.
+        """
+        raw_query = str(getattr(request, "query_string", "") or "")
+        if not raw_query:
+            query = getattr(request, "query", None)
+            if query:
+                raw_query = "present"
+        if not raw_query:
+            return None
+        return web.json_response(
+            _openai_error(
+                "Durable Worker control routes do not accept query parameters.",
+                code="invalid_durable_worker_request",
+            ),
+            status=400,
+        )
+
     async def _handle_dw_operations(self, request: "web.Request") -> "web.Response":
         session_id, _session, err = await self._dw_session_or_error(request)
         if err:
             return err
+        query_error = self._dw_control_query_error(request)
+        if query_error:
+            return query_error
         try:
             summary = self._durable_worker_control().session_summary(session_id)
         except Exception as exc:
@@ -68,6 +96,9 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
         session_id, _session, err = await self._dw_session_or_error(request)
         if err:
             return err
+        query_error = self._dw_control_query_error(request)
+        if query_error:
+            return query_error
         worker_id = str(request.match_info.get("worker_id") or "").strip()
         body, err = await self._read_json_body(request)
         if err:
@@ -110,6 +141,9 @@ class DurableWorkersControlAPIServerAdapter(DurableWorkersRuntimeAPIServerAdapte
         session_id, _session, err = await self._dw_session_or_error(request)
         if err:
             return err
+        query_error = self._dw_control_query_error(request)
+        if query_error:
+            return query_error
         worker_id = str(request.match_info.get("worker_id") or "").strip()
         activation_id = str(request.match_info.get("activation_id") or "").strip()
         body, err = await self._read_json_body(request)

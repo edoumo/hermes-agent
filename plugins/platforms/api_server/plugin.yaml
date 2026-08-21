@@ -1,16 +1,17 @@
 name: api-server-durable-workers
 label: API Server Durable Workers
 kind: platform
-version: 0.2.1
+version: 0.3.0
 description: >
-  Experimental H2.1 extension for the built-in Hermes API server. The platform
+  Experimental H4 extension for the built-in Hermes API server. The platform
   factory preserves the stock APIServerAdapter unless
   platforms.api_server.extra.durable_workers_api is explicitly enabled.
-  When enabled, session-scoped Durable Worker reads, bounded write/control
-  operations, activation dispatch and an authenticated SSE invalidation feed
-  are added for Hermes Harness UI qualification. The extension reuses the
-  existing Hermes listener, bearer authentication, CORS and profile scope.
-  Version 0.2.1 aligns activation dispatch with the native _create_agent
-  keyword contract and restores pre-launch reservations immediately on parent
-  construction failure.
+  When enabled, the qualified H2.1 session-scoped Durable Worker reads,
+  writes, activation dispatch and authenticated SSE invalidation feed remain
+  available, with H4 operator controls for session-scoped operational counts,
+  retry of terminal failed workers and cancellation of locally supervised
+  activations. Cancellation remains fail-closed: durable intent is persisted
+  before lifecycle interruption, and a worker is released only after terminal
+  CANCELLED is observed. The extension reuses the existing Hermes listener,
+  bearer authentication, CORS and profile scope.
 author: MITC

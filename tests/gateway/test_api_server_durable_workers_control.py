@@ -16,6 +16,22 @@ async def _session_ok(_request):
     return "session-1", {"id": "session-1"}, None
 
 
+def _allow_owned_worker(adapter, *, worker_id="dw-1"):
+    """Stub the H4 read-only ownership projection for unit-handler tests."""
+
+    class Projection:
+        def get_worker(self, parent, requested_worker_id):
+            assert parent == "session-1"
+            assert requested_worker_id == worker_id
+            return {
+                "worker_id": requested_worker_id,
+                "parent_session_id": parent,
+                "status": "RUNNING",
+            }
+
+    adapter._durable_worker_projection = lambda: Projection()
+
+
 def test_h4_control_routes_extend_h21_without_new_listener():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     routes = [(method, path) for method, path, _handler in adapter._http_route_table()]
@@ -66,6 +82,7 @@ async def test_operations_summary_is_session_scoped_and_reports_limit():
 async def test_retry_handler_passes_revision_cas_and_returns_retry_ready():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
+    _allow_owned_worker(adapter)
 
     async def _body(_request):
         return {"expected_revision": 7}, None
@@ -98,6 +115,7 @@ async def test_retry_handler_passes_revision_cas_and_returns_retry_ready():
 async def test_cancel_requires_locally_supervised_matching_activation():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
+    _allow_owned_worker(adapter)
     adapter._dw_active_lock = threading.Lock()
     adapter._dw_active_lifecycles = {}
 
@@ -141,6 +159,7 @@ async def test_cancel_requires_locally_supervised_matching_activation():
 async def test_cancel_marks_durable_intent_before_lifecycle_interrupt():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
+    _allow_owned_worker(adapter)
     adapter._dw_active_lock = threading.Lock()
     sequence = []
 
@@ -204,6 +223,7 @@ async def test_cancel_marks_durable_intent_before_lifecycle_interrupt():
 async def test_cancel_rejection_rolls_back_durable_marker():
     adapter = object.__new__(DurableWorkersControlAPIServerAdapter)
     adapter._dw_session_or_error = _session_ok
+    _allow_owned_worker(adapter)
     adapter._dw_active_lock = threading.Lock()
 
     async def _body(_request):

@@ -9,9 +9,11 @@ description: >
   When enabled, the qualified H2.1/H4 Durable Worker read, write, activation,
   SSE and operational recovery surfaces remain available. H5 adds a bounded
   task-DAG orchestration layer: pending task editing and reassignment, CAS-safe
-  dependency add/remove, read-only graph projection, and atomic dispatch of a
-  READY task into the existing Durable Worker lifecycle. Task results are
-  reconciled automatically to completed/failed/pending while live lifecycle
-  handles remain transient. The extension reuses the existing Hermes listener,
-  bearer authentication, CORS and profile scope.
+  dependency add/remove, read-only graph projection, atomic dispatch of a READY
+  task into the existing Durable Worker lifecycle, and task-aware recovery that
+  reuses the same durable task message after operator cancellation or failure
+  while creating a fresh activation. Task results reconcile automatically to
+  completed/failed/pending and live lifecycle handles remain transient. The
+  extension reuses the existing Hermes listener, bearer authentication, CORS
+  and profile scope.
 author: MITC

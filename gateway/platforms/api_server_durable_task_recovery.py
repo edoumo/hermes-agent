@@ -28,6 +28,16 @@ class DurableWorkersTaskRecoveryAPIServerAdapter(
         ),
     )
 
+    def __init__(self, config):
+        super().__init__(config)
+        # Do not create a Durable Worker DB merely by enabling H5. If a store
+        # already exists, constructing it first applies qualified H1 abandoned
+        # activation recovery; constructing the H5 orchestrator then projects
+        # those durable states back onto any stale in-progress tasks.
+        if self._durable_worker_db_path().exists():
+            store = self._durable_worker_store()
+            RecoverableDurableTaskOrchestrator(store)
+
     def _http_route_table(self) -> list[tuple]:
         routes = list(super()._http_route_table())
         routes.extend(

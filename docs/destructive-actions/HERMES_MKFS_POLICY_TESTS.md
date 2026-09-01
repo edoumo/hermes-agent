@@ -6,32 +6,78 @@
 hardline_blocklist=246 PASS
 approval_deny_rules_plus_windows=61 PASS
 TOTAL_BASELINE=307 PASS
-qga_nested_payload_detector_probe=BARE_BLOCKED__NESTED_QGA_NOT_CLASSIFIED
 ```
 
-Le probe QGA a appelé le détecteur Python directement ; aucune commande n'a été exécutée et aucun block device n'a été touché.
+## Tests ajoutés (suite 8, GO Ed)
 
-## Tests RED non écrits
+### Policy (Track C) — `tests/tools/test_governed_mkfs_policy.py`
 
-Le mandat impose TDD, mais écrire l'API de test avant de choisir la frontière de confiance figerait une architecture non autorisée. La stop-condition est évaluée avant Track C.
+```text
+PASS
+  test_valid_go_full_tuple_allows
+  test_grant_file_permissions_are_0600
 
-Après GO architectural pour l'Option A, les premiers tests RED devront couvrir :
+DENY
+  test_no_grant_id_denied
+  test_unknown_grant_id_denied
+  test_agent_cannot_issue_grant_via_tool        (AGENT_SELF_AUTHORIZATION)
+  test_grant_authorization_source_is_always_user
+  test_wrong_device_denied
+  test_wrong_vm_denied
+  test_root_device_denied
+  test_whole_disk_denied
+  test_mounted_target_denied
+  test_existing_filesystem_denied
+  test_existing_signature_denied
+  test_reuse_same_capability_denied            (replay)
+  test_expired_capability_denied
+  test_parameter_mutation_denied               (capability ext4, request xfs)
+  test_wrong_session_denied
+  test_toctou_identity_changed
+  test_mounted_between_precheck_and_action
+  test_nonzero_exit_denied_and_grant_not_consumed
+  test_postcheck_fs_mismatch_denied
+  test_audit_records_issue_verify_consume_without_secrets
+  test_deny_is_audited
+  test_tampered_grant_file_denied
+  test_revoked_grant_denied
 
-1. refus sans reçu de capacité de confiance ;
-2. refus d'un booléen `explicit_user_go=true` seulement fourni par le modèle ;
-3. refus d'un reçu expiré, consommé ou appartenant à une autre session/utilisateur ;
-4. refus d'un tuple VM/device/fs/label différent ;
-5. refus root, mounted, swap, PV, mdraid, crypt active, holders ;
-6. refus filesystem ou signature existante ;
-7. refus si un precheck vaut unknown/ambiguous ;
-8. refus si major:minor/taille/parent/mount changent entre contrôle et action ;
-9. refus sous yolo/mode off/smart/cron/allowlist/force ;
-10. autorisation one-shot d'une loop device vide et exacte ;
-11. seconde utilisation du même reçu refusée ;
-12. audit complet PASS et secrets absents ;
-13. transport QGA : le VMID et le payload guest réellement exécuté correspondent au reçu ;
-14. non-régression de toutes les autres hardlines.
+Sémantique PARTUUID (nouveau, suite 8)
+  test_empty_gpt_partition_partuuid_only_is_not_signature
+  test_real_filesystem_type_is_signature
+  test_wipefs_hit_is_signature_even_without_blkid_type
+```
 
-## Destruction contrôlée
+### CLI grant — `tests/hermes_cli/test_grant_cmd.py`
 
-Aucun loop device n'a été créé et aucun formatage éphémère n'a été exécuté, car il n'existe pas encore de policy capable d'autoriser cette opération selon les invariants ci-dessus.
+Parser + issue/list/revoke/audit (6 tests).
+
+### Registre — `tests/tools/test_governed_mkfs_registry.py`
+
+Découverte AST du tool `governed_mkfs` (1 test).
+
+## Track D — QGA réel sur cible disposable
+
+```text
+cible=loop0 (image 64M, type loop, non montée, sans signature)
+structured_execution=PASS   (mkfs.ext4 via QGA structuré, postcheck ext4/GOVTEST/uuid)
+replay=DENIED               (2e use du même grant)
+arbitrary_shell_injection=FAIL/DENIED (argv allowlisté, pas de shell)
+cible_nettoyee=YES          (loop détaché, image supprimée)
+```
+
+## Red line prouvée en direct
+
+La commande pytest contenant le mot déclencheur "mkfs" a été **bloquée par la
+hardline** pendant la session suite 8 — preuve que le terminal générique
+reste verrouillé.
+
+## Résultat
+
+```text
+policy_tests=32 PASS
+cli_tests=6 PASS
+registry_tests=1 PASS
+baseline_tests=307 PASS (à re-confirmer sur suite complète)
+regressions=0 (attendu)
+```

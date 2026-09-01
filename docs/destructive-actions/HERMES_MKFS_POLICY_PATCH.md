@@ -36,7 +36,7 @@ Ce changement traverse plusieurs trust boundaries et constitue un `changement ar
 
 ### Option A — recommandée
 
-Capacité destructrice one-shot émise par l'interface utilisateur + transport QGA structuré + préchecks core + audit. Répond à tous les critères mais représente une évolution architecturale.
+Capacité destructrice one-shot émise par l'interface utilisateur + outil dédié `governed_mkfs` + transport QGA structuré + préchecks core + audit. Le terminal générique reste hardline. Répond à tous les critères mais représente une évolution architecturale.
 
 ### Option B — non conforme au mandat actuel
 

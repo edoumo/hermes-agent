@@ -6,12 +6,13 @@
   "stop_condition": "mandate_section_29",
   "architecture_change_required": true,
   "architecture_change_class": "MAJOR",
-  "recommended_option": "TRUSTED_ONE_SHOT_DESTRUCTIVE_CAPABILITY_PLUS_STRUCTURED_QGA",
+  "recommended_option": "TRUSTED_ONE_SHOT_CAPABILITY_PLUS_GOVERNED_MKFS_PLUS_STRUCTURED_QGA",
   "development": {
     "repository": "/home/edou/workspace/hermes-destructive-policy",
     "branch": "feat/destructive-explicit-approval",
-    "head": "894fc35337f3380897fe1a67d42aeb6403b359ef",
-    "code_modified": false
+    "base_head": "894fc35337f3380897fe1a67d42aeb6403b359ef",
+    "deliverables_initial_commit": "d62b5f7725fc43f239963befe084887cfe78ef6f",
+    "production_code_modified": false
   },
   "runtime": {
     "path": "/usr/local/lib/hermes-agent",
@@ -32,6 +33,8 @@
   "safety": {
     "policy_weakened": false,
     "other_hardlines_changed": false,
+    "generic_terminal_remains_hardline": true,
+    "attachment_alone_is_trusted_go": false,
     "ephemeral_format_test_executed": false,
     "vm148_mutated": false
   },

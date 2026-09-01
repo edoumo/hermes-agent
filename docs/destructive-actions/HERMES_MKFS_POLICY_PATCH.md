@@ -3,43 +3,53 @@
 ## Patch status
 
 ```text
-PATCH_STATUS=NOT_APPLIED
-CODE_CHANGE=NONE
-RUNTIME_CHANGE=NONE
-REASON=MANDATE_STOP_CONDITION_TRIGGERED
+PATCH_STATUS=APPLIED
+CODE_CHANGE=YES
+RUNTIME_CHANGE=YES
+REASON=GO_ED_SUITE8
 ```
 
-## Pourquoi un patch minimal dans `tools/approval.py` serait dangereux
+## Décision (suite 7 -> suite 8)
 
-Retirer simplement la règle hardline ferait tomber l'opération dans `DANGEROUS_PATTERNS`, où elle pourrait être autorisée par yolo, mode off, smart approval, cron approve ou allowlist persistante. Cela violerait explicitement les red lines.
+La suite 7 a conclu qu'un patch minimal dans `tools/approval.py` serait
+dangereux : retirer la règle hardline ferait tomber l'opération dans
+`DANGEROUS_PATTERNS` (yolo, mode off, smart approval, cron approve,
+allowlist persistante). Ajouter une exception basée sur des booléens fournis
+par le modèle ne prouverait ni la provenance du GO ni l'état du disque.
+`force=True` saute l'ensemble du moteur de guards.
 
-Ajouter une exception basée sur des booléens fournis dans les arguments du tool ferait confiance au modèle pour affirmer `explicit_user_go=true` et `prechecks=PASS`. Cela ne prouve ni la provenance du GO ni l'état du disque.
+**Option A retenue par Ed (GO suite 8)** : capacité destructrice one-shot
+émise à la frontière utilisateur + outil dédié `governed_mkfs` + transport
+QGA structuré + préchecks core fail-closed + audit. Le terminal générique
+reste hardline.
 
-Réutiliser `force=True` est également interdit : `terminal_tool()` saute alors l'ensemble du moteur de guards.
+## Ce qui a été implémenté (suite 8)
 
-## Surface minimale réellement nécessaire
+| Composant | Fichier | Rôle |
+|---|---|---|
+| Store de grants | `tools/destructive_grants.py` | issue/verify/consume/revoke/audit, fichier 0600, binding SHA256, nonce, TTL |
+| Frontière utilisateur | `hermes_cli/subcommands/grant.py` | `hermes grant issue/list/revoke/audit` — CLI uniquement, jamais un tool modèle |
+| Outil gouverné | `tools/governed_mkfs_tool.py` | `governed_mkfs` : verify -> prechecks -> TOCTOU -> exec structurée -> postcheck -> consume |
+| Adaptateur QGA | `tools/qga_structured.py` | argv allowlisté, prechecks §13, postcheck blkid, parseur corrigé |
+| Dispatch | `hermes_cli/main.py` | `cmd_grant` + parser |
 
-Une correction conforme toucherait au minimum :
+## Red lines préservées
 
-- l'ingress CLI/gateway/WebUI pour émettre un reçu utilisateur de confiance ;
-- le stockage/session pour conserver et consommer atomiquement ce reçu ;
-- `agent/tool_executor.py` / dispatch pour transporter un identifiant opaque ;
-- `tools/approval.py` pour la nouvelle classe et sa précédence ;
-- `tools/terminal_tool.py` pour exécuter les préchecks via le backend réel sans `force` ;
-- un adaptateur QGA structuré pour lier node/VMID/commande guest ;
-- le système d'audit pour prechecks/décision/exécution/postchecks ;
-- les tests CLI, gateway, terminal local/SSH/QGA et les docs.
+- `TERMINAL_POLICY_WEAKENED=NO` : `mkfs` reste hardline dans le terminal
+  générique (prouvé en Track D : la commande pytest contenant "mkfs" a été
+  bloquée par la hardline).
+- `ARBITRARY_ROOT_SHELL_CAPABILITY=NO` : argv construit côté code de
+  confiance, jamais de shell libre.
+- `AGENT_SELF_AUTHORIZATION=NO` : aucun tool modèle ne peut émettre un grant.
+- `CAPABILITY_REPLAY=NO` : consommation atomique, replay DENIED (prouvé en
+  Track D réel).
+- `ROOT_DEVICE_FORMAT=IMPOSSIBLE` : validation device (partition/loop
+  uniquement, jamais disque entier, jamais root).
 
-Ce changement traverse plusieurs trust boundaries et constitue un `changement architectural majeur Hermes` au sens du §27. Il exige donc un GO séparé.
+## Tests
 
-## Options soumises à décision
-
-### Option A — recommandée
-
-Capacité destructrice one-shot émise par l'interface utilisateur + outil dédié `governed_mkfs` + transport QGA structuré + préchecks core + audit. Le terminal générique reste hardline. Répond à tous les critères mais représente une évolution architecturale.
-
-### Option B — non conforme au mandat actuel
-
-Prompt humain one-shot juste avant l'action via l'approval UI existante. Plus petit, mais redemande une confirmation et ne représente pas le GO déjà présent ; les préchecks et QGA restent à intégrer. Ne satisfait pas le §13.
-
-Aucune branche distante ni PR n'a été créée, car il n'existe pas encore de choix d'architecture autorisé à proposer comme code.
+- 32 tests policy (dont 3 nouveaux `TestPrecheckPartuuidSemantics`).
+- 6 tests CLI grant.
+- 1 test découverte registre.
+- Track D réel : loop device 64M, exécution structurée PASS, replay DENIED.
+- Baseline complète : en cours (voir REPORT.md).

@@ -1,51 +1,64 @@
-# REPORT — CI/CD suite7 — Hermes destructive storage policy
+# REPORT — CI/CD suite8 — Hermes Trusted One-Shot Capability + Governed MKFS + Structured QGA
 
-## Verdict décisionnel
+## Verdict
 
-`BLOCKED_NEEDS_ED_DECISION`
+`HERMES_GOVERNED_DESTRUCTIVE_CAPABILITY_QUALIFIED` (en cours — VM148 et Mailcow suivent)
 
-## Cause exacte
+## GO Ed
 
-Hermes sait demander une approbation humaine pour une commande dangereuse, mais ne sait pas représenter de manière de confiance un GO destructif déjà inclus dans un mandat. Un attachment non signé n'est pas à lui seul une preuve d'adoption de toutes ses instructions ; `user_task` est enrichi par le gateway et ne peut pas faire autorité. Le moteur terminal ne reçoit pas de reçu utilisateur lié au tuple ; `force=True` saute les guards ; le helper QGA est un transport shell opaque. Un probe direct du détecteur amont confirme en plus que le payload imbriqué `ssh/qm guest exec` n'est actuellement classé ni hardline ni dangereux. Une exception locale dans la regex ne pourrait donc garantir ni provenance du GO, ni binding VM/device, ni préchecks fail-closed, ni TOCTOU.
+Mandat suite 8 (attachment 2026-09-01) : GO explicite pour
+`TRUSTED_ONE_SHOT_CAPABILITY + GOVERNED_MKFS + STRUCTURED_QGA`, déploiement
+rollbackable, restart Hermes autorisé, VM148 `/dev/sdb1` préautorisé (§29),
+reprise Mailcow automatique (§34).
 
-Le §29 impose l'arrêt dans ce cas. Le §27 exige un GO séparé pour le changement architectural majeur nécessaire.
+## Réalisé (Track B-F)
 
-## Réalisé
+- `tools/destructive_grants.py` — store one-shot (issue/verify/consume/revoke/audit,
+  fichier 0600, binding SHA256, nonce, TTL max 3600s, session binding).
+- `hermes_cli/subcommands/grant.py` + `hermes_cli/main.py` — frontière
+  utilisateur `hermes grant issue/list/revoke/audit` (CLI uniquement).
+- `tools/governed_mkfs_tool.py` — outil modèle `governed_mkfs` (verify ->
+  prechecks §13 fail-closed -> TOCTOU recheck -> exec structurée -> postcheck
+  -> consume atomique).
+- `tools/qga_structured.py` — adaptateur QGA structuré (argv allowlisté,
+  parseur corrigé, sémantique PARTUUID corrigée).
+- Tests : 32 policy + 6 CLI + 1 registre = 39 nouveaux.
+- Track D réel : loop device 64M sur VM148, exécution structurée PASS,
+  replay DENIED, cible nettoyée.
+- Déploiement runtime via `hermes-admin` (backups + manifest), restart
+  gateway + WebUI, registre vérifié (93 tools, `governed_mkfs` exposé).
+- Branche poussée : `feat/destructive-explicit-approval` (3 commits).
 
-- hardline, matcher et précédence local/SSH/QGA localisés ;
-- runtime et worktree sources identifiés ;
-- 12 hardlines inventoriées ;
-- autres commandes stockage recherchées sans élargissement ;
-- 307 tests baseline PASS ;
-- doctrine et architecture sûre proposées ;
-- huit livrables créés ;
-- aucune mutation runtime, aucun restart, aucune opération VM148.
+## Correctif PARTUUID (découvert en requalification)
 
-## Non réalisé par sécurité
+`blkid` retourne rc=0 avec `PARTUUID=` pour toute partition GPT même vide —
+identité de table, pas signature de données. Corrigé (seul `TYPE=` ou hit
+`wipefs` compte), testé (3 cas), déployé sur runtime, requalification VM148
+verte.
 
-- aucun test RED d'une API non décidée ;
-- aucun patch ;
-- aucun déploiement ;
-- aucun test loop destructif ;
-- aucun formatage VM148 ;
-- aucune reprise Mailcow.
+## Requalification VM148 (§30)
 
-## Décision requise
-
-Autoriser ou refuser l'Option A : une capacité destructrice one-shot créée à la frontière utilisateur, un outil dédié `governed_mkfs` laissant le terminal générique en hardline, un transport QGA structuré, des préchecks core fail-closed et un audit atomique. C'est la plus petite architecture qui satisfait réellement le mandat, mais elle traverse gateway/WebUI/agent/exécution/audit et constitue donc le GO séparé explicitement prévu.
+```text
+target_identity=PASS (hp-mail, boot_id 2fb95573…)
+device_exists=YES  is_block_device=YES  major_minor=8:17
+size=137438953472 (128G)  parent=sdb1
+mounted=NO  swap=NO  filesystem_existing=NO  filesystem_signature=NO
+lvm_member=NO  mdraid_member=NO  holders=NONE  docker_use=NO  fstab_use=NO
+```
 
 ## État final
 
 ```text
-status=BLOCKED_NEEDS_ED_DECISION
-blocker=NO_TRUSTED_REPRESENTATION_OF_EXISTING_EXPLICIT_GO
-architecture_change_required=YES
-architecture_change_class=MAJOR
-recommended_option=TRUSTED_ONE_SHOT_CAPABILITY_PLUS_GOVERNED_MKFS_PLUS_STRUCTURED_QGA
-policy_weakened=NO
-runtime_mutated=NO
-services_restarted=NO
-vm148_mutated=NO
-mailcow_state_replayed=NO
-baseline_tests=307_PASS
+status=HERMES_GOVERNED_DESTRUCTIVE_CAPABILITY_QUALIFIED
+terminal_policy_weakened=NO
+trusted_one_shot_capability=PASS
+go_origin_binding=PASS
+target_binding=PASS
+replay_protection=PASS
+structured_qga=PASS
+governed_mkfs=PASS
+regression_tests=PENDING (suite complète en cours)
+runtime_rollback=READY
+vm148_mkfs=PENDING (gate regression_tests)
+mailcow_resumed=NO
 ```

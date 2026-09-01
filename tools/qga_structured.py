@@ -204,11 +204,16 @@ def qga_prechecks(vm_id: str, device: str) -> Dict[str, object]:
         checks["mounted"] = True
         checks["mount_target"] = findmnt["out_data"].strip()
 
-    # blkid: existing filesystem / signature
+    # blkid: existing filesystem / signature.  NOTE: blkid returns rc=0 with
+    # PARTUUID= for ANY GPT partition, even a completely empty one — that is
+    # partition-table identity, not a data signature.  Only a real filesystem
+    # TYPE= (or another data signature) counts as a signature here; the
+    # wipefs -n check below is the authoritative data-signature probe.
     blkid = _qm_guest_exec(vm_id, ["blkid", device])
     if blkid["exit_code"] == 0 and blkid["out_data"].strip():
-        checks["filesystem_signature"] = True
         checks["blkid_output"] = blkid["out_data"].strip()[:300]
+        if "TYPE=" in blkid["out_data"]:
+            checks["filesystem_signature"] = True
 
     # wipefs -n: any signature (filesystem, partition table, raid, ...)
     wipefs = _qm_guest_exec(vm_id, ["wipefs", "-n", device])

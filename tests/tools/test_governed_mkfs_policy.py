@@ -301,6 +301,69 @@ class TestDenyExistingSignature:
         assert "filesystem_signature=YES" in result["failures"]
 
 
+class TestPrecheckPartuuidSemantics:
+    """blkid returns rc=0 with PARTUUID= for ANY GPT partition, even empty.
+
+    PARTUUID is partition-table identity, not a data signature.  Only a real
+    filesystem TYPE= (or a wipefs hit) must set filesystem_signature.
+    """
+
+    def _run_prechecks(self, blkid_out, wipefs_out=""):
+        import tools.qga_structured as qs
+
+        def _fake_exec(vm_id, argv, timeout=None):
+            cmd = argv[0]
+            if cmd == "lsblk":
+                out = json.dumps({
+                    "blockdevices": [{
+                        "name": "sdb1", "type": "part", "maj:min": "8:17",
+                        "size": "128G", "mountpoints": [], "fstype": None,
+                    }]
+                })
+                return {"exit_code": 0, "out_data": out, "err_data": ""}
+            if cmd == "findmnt":
+                return {"exit_code": 1, "out_data": "", "err_data": ""}
+            if cmd == "blkid":
+                return {"exit_code": 0, "out_data": blkid_out, "err_data": ""}
+            if cmd == "wipefs":
+                return {"exit_code": 0, "out_data": wipefs_out, "err_data": ""}
+            if cmd == "grep" and "swaps" in argv:
+                return {"exit_code": 1, "out_data": "", "err_data": ""}
+            if cmd == "pvs":
+                return {"exit_code": 1, "out_data": "", "err_data": ""}
+            if cmd == "cat":
+                return {"exit_code": 0, "out_data": "", "err_data": ""}
+            if cmd == "ls":
+                return {"exit_code": 0, "out_data": "", "err_data": ""}
+            if cmd == "bash":
+                return {"exit_code": 0, "out_data": "", "err_data": ""}
+            return {"exit_code": 0, "out_data": "", "err_data": ""}
+
+        with patch.object(qs, "_qm_guest_exec", side_effect=_fake_exec):
+            return qs.qga_prechecks("148", "/dev/sdb1")
+
+    def test_empty_gpt_partition_partuuid_only_is_not_signature(self):
+        checks = self._run_prechecks(
+            blkid_out='/dev/sdb1: PARTUUID="c675ed5f-8323-45a3-b8d0-4e62097a1a09"'
+        )
+        assert checks["filesystem_signature"] is False
+        assert checks["device_exists"] is True
+        assert checks["is_block_device"] is True
+
+    def test_real_filesystem_type_is_signature(self):
+        checks = self._run_prechecks(
+            blkid_out='/dev/sdb1: UUID="abc" TYPE="ext4" PARTUUID="c675ed5f"'
+        )
+        assert checks["filesystem_signature"] is True
+
+    def test_wipefs_hit_is_signature_even_without_blkid_type(self):
+        checks = self._run_prechecks(
+            blkid_out='',
+            wipefs_out="DEVICE OFFSET TYPE UUID LABEL\nsdb1 0x438 ext4",
+        )
+        assert checks["filesystem_signature"] is True
+
+
 class TestDenyReplay:
     def test_reuse_same_capability_denied(self):
         grant = _issue()

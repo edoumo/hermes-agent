@@ -45,10 +45,10 @@ def _issue(
     *,
     device="/dev/sdb1",
     fs_type="ext4",
-    label="MAILCOW_DOCKER",
-    vm_id="148",
-    hostname="hp-mail",
-    subject="Ed",
+    label="DATA",
+    vm_id="101",
+    hostname="storage-guest",
+    subject="operator",
     session_id="sess-1",
     ttl=600,
 ):
@@ -92,10 +92,10 @@ def _issue(
 def _make_receipt(
     *,
     operation="CREATE_FILESYSTEM",
-    vm_id="148",
+    vm_id="101",
     device="/dev/sdb1",
     fs_type="ext4",
-    label="MAILCOW_DOCKER",
+    label="DATA",
     session_id="sess-1",
     ttl=600,
 ):
@@ -125,7 +125,7 @@ def _make_receipt(
 def _clean_prechecks(device="/dev/sdb1"):
     """A fully green precheck payload (mandate §13 all PASS)."""
     return {
-        "vm_id": "148",
+        "vm_id": "101",
         "device": device,
         "device_exists": True,
         "is_block_device": True,
@@ -144,10 +144,10 @@ def _clean_prechecks(device="/dev/sdb1"):
     }
 
 
-def _exec_ok(device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER"):
+def _exec_ok(device="/dev/sdb1", fs_type="ext4", label="DATA"):
     return {
         "operation": "CREATE_FILESYSTEM",
-        "vm_id": "148",
+        "vm_id": "101",
         "device": device,
         "fs_type": fs_type,
         "label": label,
@@ -158,7 +158,7 @@ def _exec_ok(device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER"):
     }
 
 
-def _postcheck_ok(fs_type="ext4", label="MAILCOW_DOCKER"):
+def _postcheck_ok(fs_type="ext4", label="DATA"):
     return {
         "exit_code": 0,
         "filesystem": fs_type,
@@ -167,8 +167,8 @@ def _postcheck_ok(fs_type="ext4", label="MAILCOW_DOCKER"):
     }
 
 
-def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER",
-          vm_id="148", session_id="sess-1"):
+def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="DATA",
+          vm_id="101", session_id="sess-1"):
     return json.loads(
         _handle_governed_mkfs(
             {
@@ -198,7 +198,7 @@ def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None,
     exec_result = exec_result if exec_result is not None else _exec_ok()
     postcheck = postcheck if postcheck is not None else _postcheck_ok()
     identity = identity if identity is not None else {
-        "hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A",
+        "hostname": "storage-guest", "boot_id": "boot-A", "product_uuid": "uuid-A",
     }
 
     calls = {"n": 0}
@@ -229,7 +229,7 @@ class TestPass:
         assert result["decision"] == "ALLOW"
         assert result["capability_consumed"] is True
         assert result["fs_type"] == "ext4"
-        assert result["label"] == "MAILCOW_DOCKER"
+        assert result["label"] == "DATA"
         assert result["uuid"] == "11111111-2222-3333-4444-555555555555"
         # The grant is now consumed.
         with pytest.raises(dg.GrantConsumedError):
@@ -283,7 +283,7 @@ class TestDenyAgentSelfAuthorization:
     def test_grant_authorization_source_is_always_user(self):
         grant = _issue()
         assert grant.authorization_source == "USER"
-        assert grant.authorization_subject == "Ed"
+        assert grant.authorization_subject == "operator"
 
 
 class TestDenyWrongDevice:
@@ -306,7 +306,7 @@ class TestDenyWrongDevice:
 
 class TestDenyWrongVm:
     def test_authorized_148_requested_149(self):
-        grant = _issue(vm_id="148")
+        grant = _issue(vm_id="101")
         with _mock_qga():
             result = _call(grant.grant_id, vm_id="149")
         assert result["decision"] == "DENY"
@@ -405,7 +405,7 @@ class TestPrecheckPartuuidSemantics:
             return {"exit_code": 0, "out_data": "", "err_data": ""}
 
         with patch.object(qs, "_qm_guest_exec", side_effect=_fake_exec):
-            return qs.qga_prechecks("148", "/dev/sdb1")
+            return qs.qga_prechecks("101", "/dev/sdb1")
 
     def test_empty_gpt_partition_partuuid_only_is_not_signature(self):
         checks = self._run_prechecks(
@@ -463,7 +463,7 @@ class TestDenyParameterMutation:
         assert result["reason"] == "grant_denied"
 
     def test_capability_label_a_request_label_b(self):
-        grant = _issue(label="MAILCOW_DOCKER")
+        grant = _issue(label="DATA")
         with _mock_qga():
             result = _call(grant.grant_id, label="OTHER_LABEL")
         assert result["decision"] == "DENY"
@@ -476,13 +476,13 @@ class TestDenyParameterMutation:
         with pytest.raises(dg.GrantError):
             dg.issue_grant(
                 operation="WIPEFS",
-                vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+                vm_id="101", hostname="storage-guest", device="/dev/sdb1",
                 fs_type="ext4", label="X",
-                authorization_subject="Ed", session_id="sess-1",
+                authorization_subject="operator", session_id="sess-1",
                 receipt_id=_make_receipt().receipt_id,
                 incarnation_product_uuid="uuid-A",
                 incarnation_boot_id="boot-A",
-                incarnation_hostname="hp-mail",
+                incarnation_hostname="storage-guest",
             )
 
 

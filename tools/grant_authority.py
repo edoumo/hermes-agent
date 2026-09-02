@@ -218,6 +218,19 @@ def _store_receipt(receipt: HumanApprovalReceipt) -> HumanApprovalReceipt:
     return receipt
 
 
+def peek_receipt(receipt_id: str) -> HumanApprovalReceipt:
+    """Return a receipt WITHOUT consuming it.
+
+    Used by ``issue_grant`` to validate the receipt against the requested
+    operation/target/session BEFORE the atomic consume: a denied issuance
+    must not burn the human decision.
+    """
+    receipt = _RECEIPTS.get(receipt_id)
+    if receipt is None:
+        raise ReceiptError(f"receipt {receipt_id!r} unknown or already consumed (replay denied)")
+    return receipt
+
+
 def consume_receipt(receipt_id: str) -> HumanApprovalReceipt:
     """Atomically consume a receipt (one-shot issuance).
 

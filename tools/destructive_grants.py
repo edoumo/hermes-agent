@@ -1,22 +1,33 @@
 """Trusted one-shot destructive grants.
 
 A ``DestructiveGrant`` is the only representation of an explicit user GO that
-the governed destructive path accepts.  Grants are created exclusively at a
-trusted user boundary (``hermes grant issue`` run by the user, or a gateway
-hook that has authenticated the user's own message) — never by the model.
+the governed destructive path accepts.  Grants are created exclusively from a
+correlated, one-shot human approval receipt (``tools.grant_authority``) — the
+receipt is produced by the approval layer after an explicit human
+"approve once" decision, never by the model.
 
-Design invariants (see docs/destructive-actions/HERMES_DESTRUCTIVE_ACTION_POLICY.md):
+Authority doctrine (review #100694 blocker 1):
+
+1. correlated one-shot human receipt — the receipt binds operation, target,
+   session and validity window, and is consumed atomically at issuance;
+2. keyed process-bound authentication — every grant carries an HMAC tag
+   from the process-local authority provider (never an unkeyed hash), so
+   write_file/execute_code cannot forge or extend a grant;
+3. hardline defense in depth — ``hermes grant issue`` is hardline-blocked
+   from every model surface (terminal, pty, yolo, mode=off, cron).
+
+Design invariants:
 
 1. The grant is bound to ``operation/host-or-vm/device/filesystem/label``.
 2. It is one-shot: consumption is atomic (rename-based) and replay is denied.
-3. It is short-lived: ``expires_at`` is enforced on every use.
+3. It is short-lived: ``expires_at`` is enforced on every use and never
+   exceeds the human-approved window.
 4. The model only ever sees the opaque ``grant_id``; all fields live in a
    host-side store (``~/.hermes/grants/``, mode 0600) that generic tools do
    not read.
 5. ``authorization_subject`` records who authorized (the user), and
    ``authorization_source`` is always ``USER`` — an agent-generated grant is
-   structurally impossible because the issue path is not reachable from any
-   model tool.
+   denied by the receipt gate and the keyed authentication.
 6. Every decision (issue / allow / deny / consume) is appended to the audit
    trail without secrets.
 """
@@ -455,19 +466,21 @@ def issue_grant(
 ) -> DestructiveGrant:
     """Create a one-shot grant.  ONLY callable from a trusted user boundary.
 
-    This function is deliberately not reachable from any model tool: it lives
-    in a module that no tool handler imports, and the CLI subcommand that
-    wraps it runs in the user's own shell.
-
-    ``receipt_id`` is the id of a correlated human approval receipt produced
-    by ``tools.grant_authority.request_destructive_grant_approval``.  The
-    receipt is consumed atomically here (one-shot: the same receipt cannot
-    issue a second grant).  ``incarnation_product_uuid`` /
-    ``incarnation_boot_id`` / ``incarnation_hostname`` are the durable VM
-    generation captured at issue time (review #100694 blocker 1 + blocker 3;
-    #90144/#90145).
+    The authority comes from a correlated, one-shot human approval receipt
+    (``tools.grant_authority.request_destructive_grant_approval``), not from
+    the CLI location or file permissions: the receipt is consumed atomically
+    here (one-shot: the same receipt cannot issue a second grant) and must
+    match the requested operation, target, session and validity window.
+    ``incarnation_product_uuid`` / ``incarnation_boot_id`` /
+    ``incarnation_hostname`` are the durable VM generation captured at issue
+    time (review #100694 blocker 1 + blocker 3; #90144/#90145).
     """
-    from tools.grant_authority import ReceiptError, consume_receipt, get_authority
+    from tools.grant_authority import (
+        ReceiptError,
+        consume_receipt,
+        get_authority,
+        peek_receipt,
+    )
 
     validate_operation(operation)
     validate_vm_id(vm_id)
@@ -486,8 +499,9 @@ def issue_grant(
     # B1: a grant is only minted from a correlated, one-shot human decision.
     # The receipt is produced by the approval layer AFTER an explicit human
     # "approve once"; the caller never supplies a free-form evidence dict.
+    # Peek first: a denied issuance must NOT burn the human decision.
     try:
-        receipt = consume_receipt(receipt_id)
+        receipt = peek_receipt(receipt_id)
     except ReceiptError as exc:
         raise GrantError(str(exc)) from exc
     if receipt.operation != operation or receipt.vm_id != vm_id:
@@ -499,6 +513,11 @@ def issue_grant(
         raise GrantError(
             "receipt does not match the requested device/fs/label "
             "(receipt replay or mismatch denied)"
+        )
+    if receipt.session_id != session_id:
+        raise GrantError(
+            "receipt was approved for a different session "
+            "(session-scoped authority denied)"
         )
     if receipt.expires_at < time.time():
         raise GrantError("receipt expired (human approval is no longer current)")
@@ -513,6 +532,16 @@ def issue_grant(
 
     _ensure_dir()
     now = time.time()
+    # B: the grant lifetime never exceeds the human-approved window.  The
+    # receipt's expiry is the outer bound; issuance never renews authority.
+    grant_expires_at = min(now + ttl_seconds, receipt.expires_at)
+    if grant_expires_at <= now:
+        raise GrantError("grant would expire immediately (approval window elapsed)")
+    # All validations passed: consume the receipt atomically (one-shot).
+    try:
+        consume_receipt(receipt_id)
+    except ReceiptError as exc:
+        raise GrantError(str(exc)) from exc
     nonce = secrets.token_hex(16)
     grant_id = str(uuid.uuid4())
     authority = get_authority()
@@ -531,7 +560,7 @@ def issue_grant(
         turn_id=receipt.turn_id,
         tool_call_id=receipt.tool_call_id,
         issued_at=now,
-        expires_at=now + ttl_seconds,
+        expires_at=grant_expires_at,
         nonce=nonce,
         incarnation_product_uuid=incarnation_product_uuid,
         incarnation_boot_id=incarnation_boot_id,
@@ -550,7 +579,7 @@ def issue_grant(
         authorization_source="USER",
         session_id=session_id,
         issued_at=now,
-        expires_at=now + ttl_seconds,
+        expires_at=grant_expires_at,
         nonce=nonce,
         auth_tag=auth_tag,
         authority_generation=authority.generation,

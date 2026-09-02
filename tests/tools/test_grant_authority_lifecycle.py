@@ -41,21 +41,21 @@ _EVIDENCE = {
     "request_id": "req-11111111111111111111111111111111",
     "request_digest": "d" * 64,
     "decision": "once",
-    "principal": "Ed",
+    "principal": "operator",
     "surface": "cli",
     "decided_at": 1756800000.0,
 }
 
-_INCARNATION = {"hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A"}
+_INCARNATION = {"hostname": "storage-guest", "boot_id": "boot-A", "product_uuid": "uuid-A"}
 
 
 def _make_receipt(
     *,
     operation="CREATE_FILESYSTEM",
-    vm_id="148",
+    vm_id="101",
     device="/dev/sdb1",
     fs_type="ext4",
-    label="MAILCOW_DOCKER",
+    label="DATA",
     session_id="sess-1",
     ttl=600,
 ):
@@ -87,10 +87,10 @@ def _issue(
     *,
     device="/dev/sdb1",
     fs_type="ext4",
-    label="MAILCOW_DOCKER",
-    vm_id="148",
-    hostname="hp-mail",
-    subject="Ed",
+    label="DATA",
+    vm_id="101",
+    hostname="storage-guest",
+    subject="operator",
     session_id="sess-1",
     ttl=600,
     receipt=None,
@@ -119,7 +119,7 @@ def _issue(
 
 def _clean_prechecks(device="/dev/sdb1"):
     return {
-        "vm_id": "148",
+        "vm_id": "101",
         "device": device,
         "device_exists": True,
         "is_block_device": True,
@@ -138,10 +138,10 @@ def _clean_prechecks(device="/dev/sdb1"):
     }
 
 
-def _exec_ok(device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER"):
+def _exec_ok(device="/dev/sdb1", fs_type="ext4", label="DATA"):
     return {
         "operation": "CREATE_FILESYSTEM",
-        "vm_id": "148",
+        "vm_id": "101",
         "device": device,
         "fs_type": fs_type,
         "label": label,
@@ -152,7 +152,7 @@ def _exec_ok(device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER"):
     }
 
 
-def _postcheck_ok(fs_type="ext4", label="MAILCOW_DOCKER"):
+def _postcheck_ok(fs_type="ext4", label="DATA"):
     return {
         "exit_code": 0,
         "filesystem": fs_type,
@@ -161,8 +161,8 @@ def _postcheck_ok(fs_type="ext4", label="MAILCOW_DOCKER"):
     }
 
 
-def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER",
-          vm_id="148", session_id="sess-1"):
+def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="DATA",
+          vm_id="101", session_id="sess-1"):
     return json.loads(
         _handle_governed_mkfs(
             {
@@ -225,24 +225,24 @@ class TestB1IssuanceEvidence:
         with pytest.raises(dg.GrantError):
             dg.issue_grant(
                 operation="CREATE_FILESYSTEM",
-                vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+                vm_id="101", hostname="storage-guest", device="/dev/sdb1",
                 fs_type="ext4", label="X",
-                authorization_subject="Ed", session_id="sess-1",
+                authorization_subject="operator", session_id="sess-1",
                 receipt_id="no-such-receipt",
                 incarnation_product_uuid="uuid-A",
-                incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
+                incarnation_boot_id="boot-A", incarnation_hostname="storage-guest",
             )
 
     def test_issue_rejects_unknown_receipt(self):
         with pytest.raises(dg.GrantError):
             dg.issue_grant(
                 operation="CREATE_FILESYSTEM",
-                vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+                vm_id="101", hostname="storage-guest", device="/dev/sdb1",
                 fs_type="ext4", label="X",
-                authorization_subject="Ed", session_id="sess-1",
+                authorization_subject="operator", session_id="sess-1",
                 receipt_id="rcpt-00000000000000000000000000000000",
                 incarnation_product_uuid="uuid-A",
-                incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
+                incarnation_boot_id="boot-A", incarnation_hostname="storage-guest",
             )
 
     def test_issue_rejects_mismatched_receipt(self):
@@ -251,28 +251,53 @@ class TestB1IssuanceEvidence:
         with pytest.raises(dg.GrantError):
             _issue(receipt=receipt)
 
+    def test_issue_rejects_receipt_session_mismatch(self):
+        """A receipt approved for session A must never mint a grant for
+        session B (session-scoped authority)."""
+        receipt = _make_receipt(session_id="sess-A")
+        with pytest.raises(dg.GrantError):
+            _issue(receipt=receipt, session_id="sess-B")
+        # The receipt is consumed only on success: a denied issuance must
+        # not burn the receipt (the human decision stays usable).
+        grant = _issue(receipt=receipt, session_id="sess-A")
+        assert grant.session_id == "sess-A"
+
+    def test_grant_expiry_never_exceeds_receipt_expiry(self):
+        """grant.expires_at <= receipt.expires_at always (no implicit
+        authority renewal at issuance)."""
+        receipt = _make_receipt(ttl=60)
+        grant = _issue(receipt=receipt, ttl=600)  # requested TTL > approved
+        assert grant.expires_at <= receipt.expires_at
+        assert grant.expires_at - grant.issued_at <= 60
+
+    def test_expired_receipt_cannot_issue(self):
+        """An already-expired human approval cannot mint a grant."""
+        receipt = _make_receipt(ttl=-10)  # expires in the past
+        with pytest.raises(dg.GrantError):
+            _issue(receipt=receipt)
+
     def test_issue_requires_incarnation(self):
         with pytest.raises(dg.GrantError):
             dg.issue_grant(
                 operation="CREATE_FILESYSTEM",
-                vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+                vm_id="101", hostname="storage-guest", device="/dev/sdb1",
                 fs_type="ext4", label="X",
-                authorization_subject="Ed", session_id="sess-1",
+                authorization_subject="operator", session_id="sess-1",
                 receipt_id=_make_receipt().receipt_id,
                 incarnation_product_uuid="",
-                incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
+                incarnation_boot_id="boot-A", incarnation_hostname="storage-guest",
             )
 
     def test_issue_requires_product_uuid(self):
         with pytest.raises(dg.GrantError):
             dg.issue_grant(
                 operation="CREATE_FILESYSTEM",
-                vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+                vm_id="101", hostname="storage-guest", device="/dev/sdb1",
                 fs_type="ext4", label="X",
-                authorization_subject="Ed", session_id="sess-1",
+                authorization_subject="operator", session_id="sess-1",
                 receipt_id=_make_receipt().receipt_id,
                 incarnation_product_uuid="uuid-A",
-                incarnation_boot_id="", incarnation_hostname="hp-mail",
+                incarnation_boot_id="", incarnation_hostname="storage-guest",
             )
 
     def test_receipt_is_persisted_and_bound(self):
@@ -382,8 +407,8 @@ class TestB2Claim:
         with pytest.raises(dg.GrantInFlightError):
             dg.verify_grant(
                 grant.grant_id,
-                operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
-                fs_type="ext4", label="MAILCOW_DOCKER", session_id="sess-1",
+                operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
+                fs_type="ext4", label="DATA", session_id="sess-1",
             )
 
     def test_settle_requires_matching_execution(self):
@@ -562,8 +587,8 @@ class TestB2SettlementOutcomes:
         with pytest.raises(dg.GrantInFlightError):
             dg.verify_grant(
                 grant.grant_id,
-                operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
-                fs_type="ext4", label="MAILCOW_DOCKER", session_id="sess-1",
+                operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
+                fs_type="ext4", label="DATA", session_id="sess-1",
             )
 
 
@@ -574,10 +599,10 @@ class TestB2SettlementOutcomes:
 
 class TestB3GenerationFencing:
     def test_incarnation_mismatch_denied_at_sink(self):
-        grant = _issue(incarnation={"hostname": "hp-mail", "boot_id": "boot-A",
+        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
                                     "product_uuid": "uuid-A"})
         exec_calls = []
-        with _mock_qga(identity={"hostname": "hp-mail", "boot_id": "boot-B",
+        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-B",
                                   "product_uuid": "uuid-A"},
                        exec_side_effect=lambda: exec_calls.append(1)):
             result = _call(grant.grant_id)
@@ -587,19 +612,19 @@ class TestB3GenerationFencing:
         assert dg.get_grant_state(grant.grant_id) == "settled:failed_pre_effect"
 
     def test_incarnation_match_allows(self):
-        grant = _issue(incarnation={"hostname": "hp-mail", "boot_id": "boot-A",
+        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
                                      "product_uuid": "uuid-A"})
-        with _mock_qga(identity={"hostname": "hp-mail", "boot_id": "boot-A",
+        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-A",
                                  "product_uuid": "uuid-A"}):
             result = _call(grant.grant_id)
         assert result["decision"] == "ALLOW"
 
     def test_aba_witness_generation_b_untouched(self):
         """A issued for gen A; VM replaced by gen B; A resumes -> B untouched."""
-        grant = _issue(incarnation={"hostname": "hp-mail", "boot_id": "boot-A",
+        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
                                     "product_uuid": "uuid-A"})
         exec_calls = []
-        with _mock_qga(identity={"hostname": "hp-mail", "boot_id": "boot-B",
+        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-B",
                                  "product_uuid": "uuid-A"},
                        exec_side_effect=lambda: exec_calls.append(1)):
             result = _call(grant.grant_id)
@@ -609,10 +634,10 @@ class TestB3GenerationFencing:
     def test_vm_replacement_denied_at_sink(self):
         """Same vm_id + same device + same hostname, NEW product_uuid:
         the grant for the old incarnation must not mutate the new VM."""
-        grant = _issue(incarnation={"hostname": "hp-mail", "boot_id": "boot-A",
+        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
                                     "product_uuid": "uuid-A"})
         exec_calls = []
-        with _mock_qga(identity={"hostname": "hp-mail", "boot_id": "boot-A",
+        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-A",
                                  "product_uuid": "uuid-B"},
                        exec_side_effect=lambda: exec_calls.append(1)):
             result = _call(grant.grant_id)
@@ -622,11 +647,11 @@ class TestB3GenerationFencing:
         assert dg.get_grant_state(grant.grant_id) == "settled:failed_pre_effect"
 
     def test_boot_id_in_toctou_snapshot(self):
-        grant = _issue(incarnation={"hostname": "hp-mail", "boot_id": "boot-A",
+        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
                                     "product_uuid": "uuid-A"})
         recheck = _clean_prechecks()
         recheck["boot_id"] = "boot-B"
-        with _mock_qga(identity={"hostname": "hp-mail", "boot_id": "boot-A",
+        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-A",
                                  "product_uuid": "uuid-A"},
                        recheck=recheck):
             result = _call(grant.grant_id)

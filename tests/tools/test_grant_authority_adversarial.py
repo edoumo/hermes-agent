@@ -145,10 +145,10 @@ def test_child_process_cannot_issue_valid_grant():
         "device='/dev/sdb1', fs_type='ext4', label='X', "
         "issued_at=time.time(), expires_at=time.time()+600)); "
         "g = dg.issue_grant(operation='CREATE_FILESYSTEM', vm_id='148', "
-        "hostname='hp-mail', device='/dev/sdb1', fs_type='ext4', label='X', "
-        "authorization_subject='Ed', session_id='sess-1', "
+        "hostname='storage-guest', device='/dev/sdb1', fs_type='ext4', label='X', "
+        "authorization_subject='operator', session_id='sess-1', "
         "receipt_id=r.receipt_id, incarnation_product_uuid='uuid-A', "
-        "incarnation_boot_id='boot-A', incarnation_hostname='hp-mail'); "
+        "incarnation_boot_id='boot-A', incarnation_hostname='storage-guest'); "
         "print(g.grant_id)"
         % os.getcwd()
     )
@@ -173,12 +173,12 @@ def test_forge_arbitrary_grant_json_denied():
     forged = {
         "grant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "operation": "CREATE_FILESYSTEM",
-        "vm_id": "148",
-        "hostname": "hp-mail",
+        "vm_id": "101",
+        "hostname": "storage-guest",
         "device": "/dev/sdb1",
         "fs_type": "ext4",
         "label": "X",
-        "authorization_subject": "Ed",
+        "authorization_subject": "operator",
         "authorization_source": "USER",
         "session_id": "sess-1",
         "issued_at": time.time(),
@@ -191,7 +191,7 @@ def test_forge_arbitrary_grant_json_denied():
         "authorization_evidence": {},
         "incarnation_product_uuid": "uuid-A",
         "incarnation_boot_id": "boot-A",
-        "incarnation_hostname": "hp-mail",
+        "incarnation_hostname": "storage-guest",
     }
     _write_grant(forged["grant_id"], forged)
     with pytest.raises(dg.GrantDeniedError):
@@ -282,12 +282,12 @@ def test_receipt_serialized_replay_denied():
     with pytest.raises(dg.GrantError):
         dg.issue_grant(
             operation="CREATE_FILESYSTEM",
-            vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+            vm_id="101", hostname="storage-guest", device="/dev/sdb1",
             fs_type="ext4", label="X",
-            authorization_subject="Ed", session_id="sess-1",
+            authorization_subject="operator", session_id="sess-1",
             receipt_id=str(serialized["receipt_id"]),
             incarnation_product_uuid="uuid-A",
-            incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
+            incarnation_boot_id="boot-A", incarnation_hostname="storage-guest",
         )
 
 
@@ -468,7 +468,7 @@ def test_approval_gate_refuses_yolo(monkeypatch):
     monkeypatch.setattr(approval_mod, "is_approval_bypass_active", lambda: True)
     with pytest.raises(ReceiptError):
         request_destructive_grant_approval(
-            operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
+            operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
             fs_type="ext4", label="X", session_id="sess-1", ttl_seconds=600,
         )
 
@@ -481,7 +481,7 @@ def test_approval_gate_refuses_cron(monkeypatch):
     monkeypatch.setattr(approval_mod, "_is_cron_approval_context", lambda: True)
     with pytest.raises(ReceiptError):
         request_destructive_grant_approval(
-            operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
+            operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
             fs_type="ext4", label="X", session_id="sess-1", ttl_seconds=600,
         )
 
@@ -495,7 +495,7 @@ def test_approval_gate_refuses_unattended(monkeypatch):
     monkeypatch.setattr(approval_mod, "_is_unattended_platform_approval_context", lambda: True)
     with pytest.raises(ReceiptError):
         request_destructive_grant_approval(
-            operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
+            operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
             fs_type="ext4", label="X", session_id="sess-1", ttl_seconds=600,
         )
 
@@ -510,7 +510,7 @@ def test_approval_gate_refuses_single_query(monkeypatch):
     monkeypatch.setattr(approval_mod, "_is_single_query_approval_context", lambda: True)
     with pytest.raises(ReceiptError):
         request_destructive_grant_approval(
-            operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
+            operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
             fs_type="ext4", label="X", session_id="sess-1", ttl_seconds=600,
         )
 
@@ -527,7 +527,7 @@ def test_approval_gate_refuses_no_human_surface(monkeypatch):
     monkeypatch.setattr(approval_mod, "_is_gateway_approval_context", lambda: False)
     with pytest.raises(ReceiptError):
         request_destructive_grant_approval(
-            operation="CREATE_FILESYSTEM", vm_id="148", device="/dev/sdb1",
+            operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
             fs_type="ext4", label="X", session_id="sess-1", ttl_seconds=600,
         )
 
@@ -544,12 +544,12 @@ def test_forged_grant_never_reaches_qga():
     forged = {
         "grant_id": forged_id,
         "operation": "CREATE_FILESYSTEM",
-        "vm_id": "148",
-        "hostname": "hp-mail",
+        "vm_id": "101",
+        "hostname": "storage-guest",
         "device": "/dev/sdb1",
         "fs_type": "ext4",
         "label": "X",
-        "authorization_subject": "Ed",
+        "authorization_subject": "operator",
         "authorization_source": "USER",
         "session_id": "sess-1",
         "issued_at": time.time(),
@@ -562,7 +562,7 @@ def test_forged_grant_never_reaches_qga():
         "authorization_evidence": {},
         "incarnation_product_uuid": "uuid-A",
         "incarnation_boot_id": "boot-A",
-        "incarnation_hostname": "hp-mail",
+        "incarnation_hostname": "storage-guest",
     }
     _write_grant(forged_id, forged)
     exec_calls = []
@@ -586,10 +586,10 @@ def test_child_minted_grant_never_reaches_qga():
         "device='/dev/sdb1', fs_type='ext4', label='X', "
         "issued_at=time.time(), expires_at=time.time()+600)); "
         "g = dg.issue_grant(operation='CREATE_FILESYSTEM', vm_id='148', "
-        "hostname='hp-mail', device='/dev/sdb1', fs_type='ext4', label='X', "
-        "authorization_subject='Ed', session_id='sess-1', "
+        "hostname='storage-guest', device='/dev/sdb1', fs_type='ext4', label='X', "
+        "authorization_subject='operator', session_id='sess-1', "
         "receipt_id=r.receipt_id, incarnation_product_uuid='uuid-A', "
-        "incarnation_boot_id='boot-A', incarnation_hostname='hp-mail'); "
+        "incarnation_boot_id='boot-A', incarnation_hostname='storage-guest'); "
         "print(g.grant_id)"
         % os.getcwd()
     )

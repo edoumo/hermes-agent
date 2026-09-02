@@ -13,7 +13,7 @@ from hermes_cli.subcommands.grant import (
     run_grant_command,
 )
 
-_IDENTITY = {"hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A"}
+_IDENTITY = {"hostname": "storage-guest", "boot_id": "boot-A", "product_uuid": "uuid-A"}
 
 
 def _fake_receipt_dict():
@@ -28,10 +28,10 @@ def _fake_receipt_dict():
             turn_id="turn-1",
             tool_call_id="tool-1",
             operation="CREATE_FILESYSTEM",
-            vm_id="148",
+            vm_id="101",
             device="/dev/sdb1",
             fs_type="ext4",
-            label="MAILCOW_DOCKER",
+            label="DATA",
             issued_at=time.time(),
             expires_at=time.time() + 600,
         )
@@ -68,22 +68,22 @@ class TestGrantParser:
             [
                 "grant", "issue",
                 "--operation", "CREATE_FILESYSTEM",
-                "--vm", "148",
-                "--hostname", "hp-mail",
+                "--vm", "101",
+                "--hostname", "storage-guest",
                 "--device", "/dev/sdb1",
                 "--fs", "ext4",
-                "--label", "MAILCOW_DOCKER",
-                "--subject", "Ed",
+                "--label", "DATA",
+                "--subject", "operator",
                 "--session", "sess-1",
                 "--ttl", "300",
             ]
         )
         assert args.grant_command == "issue"
-        assert args.vm_id == "148"
+        assert args.vm_id == "101"
         assert args.device == "/dev/sdb1"
         assert args.fs_type == "ext4"
-        assert args.label == "MAILCOW_DOCKER"
-        assert args.subject == "Ed"
+        assert args.label == "DATA"
+        assert args.subject == "operator"
         assert args.session_id == "sess-1"
         assert args.ttl == 300
         assert hasattr(args, "func")
@@ -108,12 +108,12 @@ class TestGrantCommand:
             [
                 "grant", "issue",
                 "--operation", "CREATE_FILESYSTEM",
-                "--vm", "148",
-                "--hostname", "hp-mail",
+                "--vm", "101",
+                "--hostname", "storage-guest",
                 "--device", "/dev/sdb1",
                 "--fs", "ext4",
-                "--label", "MAILCOW_DOCKER",
-                "--subject", "Ed",
+                "--label", "DATA",
+                "--subject", "operator",
                 "--session", "sess-1",
             ]
         )
@@ -130,7 +130,7 @@ class TestGrantCommand:
         assert rc == 0
         out = capsys.readouterr().out
         assert grant_id in out
-        assert "MAILCOW_DOCKER" in out
+        assert "DATA" in out
 
         # audit shows the issue event
         audit_args = _make_parser().parse_args(["grant", "audit"])
@@ -154,12 +154,12 @@ class TestGrantCommand:
             [
                 "grant", "issue",
                 "--operation", "CREATE_FILESYSTEM",
-                "--vm", "148",
-                "--hostname", "hp-mail",
+                "--vm", "101",
+                "--hostname", "storage-guest",
                 "--device", "/dev/sda1",
                 "--fs", "ext4",
                 "--label", "X",
-                "--subject", "Ed",
+                "--subject", "operator",
                 "--session", "sess-1",
             ]
         )
@@ -178,12 +178,12 @@ class TestGrantCommand:
             [
                 "grant", "issue",
                 "--operation", "CREATE_FILESYSTEM",
-                "--vm", "148",
-                "--hostname", "hp-mail",
+                "--vm", "101",
+                "--hostname", "storage-guest",
                 "--device", "/dev/sdb1",
                 "--fs", "ext4",
                 "--label", "X",
-                "--subject", "Ed",
+                "--subject", "operator",
                 "--session", "sess-1",
             ]
         )
@@ -214,12 +214,12 @@ class TestGrantCommand:
             [
                 "grant", "issue",
                 "--operation", "CREATE_FILESYSTEM",
-                "--vm", "148",
-                "--hostname", "hp-mail",
+                "--vm", "101",
+                "--hostname", "storage-guest",
                 "--device", "/dev/sdb1",
                 "--fs", "ext4",
                 "--label", "X",
-                "--subject", "Ed",
+                "--subject", "operator",
                 "--session", "sess-1",
             ]
         )
@@ -233,12 +233,12 @@ class TestGrantCommand:
             [
                 "grant", "issue",
                 "--operation", "CREATE_FILESYSTEM",
-                "--vm", "148",
-                "--hostname", "hp-mail",
+                "--vm", "101",
+                "--hostname", "storage-guest",
                 "--device", "/dev/sdb1",
                 "--fs", "ext4",
-                "--label", "MAILCOW_DOCKER",
-                "--subject", "Ed",
+                "--label", "DATA",
+                "--subject", "operator",
                 "--session", "sess-1",
                 "--json",
             ]

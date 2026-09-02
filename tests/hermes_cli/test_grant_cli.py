@@ -2,30 +2,47 @@
 
 import argparse
 import json
+import time
+import uuid
 
 import pytest
 
 from hermes_cli.subcommands.grant import (
-    _obtain_human_evidence as _REAL_OBTAIN_HUMAN_EVIDENCE,
+    _obtain_human_receipt as _REAL_OBTAIN_HUMAN_RECEIPT,
     build_grant_parser,
     run_grant_command,
 )
 
-_EVIDENCE = {
-    "request_id": "req-11111111111111111111111111111111",
-    "request_digest": "d" * 64,
-    "decision": "once",
-    "principal": "Ed",
-    "surface": "cli",
-}
-
 _IDENTITY = {"hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A"}
+
+
+def _fake_receipt_dict():
+    from tools.grant_authority import HumanApprovalReceipt, _store_receipt
+
+    receipt = _store_receipt(
+        HumanApprovalReceipt(
+            receipt_id="rcpt-" + uuid.uuid4().hex,
+            request_id="req-11111111111111111111111111111111",
+            request_digest="d" * 64,
+            session_id="sess-1",
+            turn_id="turn-1",
+            tool_call_id="tool-1",
+            operation="CREATE_FILESYSTEM",
+            vm_id="148",
+            device="/dev/sdb1",
+            fs_type="ext4",
+            label="MAILCOW_DOCKER",
+            issued_at=time.time(),
+            expires_at=time.time() + 600,
+        )
+    )
+    return receipt.to_dict()
 
 
 @pytest.fixture(autouse=True)
 def _mock_issue_boundaries(monkeypatch):
     """The issue path now requires a live QGA incarnation capture and a
-    correlated human approval decision; both are mocked in CLI tests."""
+    correlated human approval receipt; both are mocked in CLI tests."""
     from hermes_cli.subcommands import grant as grant_mod
 
     monkeypatch.setattr(
@@ -33,7 +50,7 @@ def _mock_issue_boundaries(monkeypatch):
         lambda vm_id: dict(_IDENTITY),
     )
     monkeypatch.setattr(
-        grant_mod, "_obtain_human_evidence", lambda args: dict(_EVIDENCE)
+        grant_mod, "_obtain_human_receipt", lambda args: _fake_receipt_dict()
     )
 
 
@@ -188,10 +205,10 @@ class TestGrantCommand:
                 return False
 
         monkeypatch.setattr(grant_mod.sys, "stdin", _NonTtyStdin())
-        # Restore the REAL evidence gate for this test (the autouse fixture
+        # Restore the REAL receipt gate for this test (the autouse fixture
         # mocks it away for the other tests).
         monkeypatch.setattr(
-            grant_mod, "_obtain_human_evidence", _REAL_OBTAIN_HUMAN_EVIDENCE
+            grant_mod, "_obtain_human_receipt", _REAL_OBTAIN_HUMAN_RECEIPT
         )
         args = _make_parser().parse_args(
             [
@@ -209,7 +226,7 @@ class TestGrantCommand:
         rc = run_grant_command(args)
         assert rc == 2
         err = capsys.readouterr().err
-        assert "interactive terminal" in err
+        assert "refusing unattended issuance" in err
 
     def test_issue_json_output(self, capsys):
         args = _make_parser().parse_args(

@@ -128,7 +128,10 @@ class DestructiveGrant:
     issued_at: float
     expires_at: float
     nonce: str
-    binding_sha256: str
+    auth_tag: str
+    authority_generation: str
+    receipt_id: str
+    schema_version: int
     authorization_evidence: Dict[str, object]
     incarnation_product_uuid: str
     incarnation_boot_id: str
@@ -155,7 +158,10 @@ class DestructiveGrant:
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
             "nonce": self.nonce,
-            "binding_sha256": self.binding_sha256,
+            "auth_tag": self.auth_tag,
+            "authority_generation": self.authority_generation,
+            "receipt_id": self.receipt_id,
+            "schema_version": self.schema_version,
             "authorization_evidence": self.authorization_evidence,
             "incarnation_product_uuid": self.incarnation_product_uuid,
             "incarnation_boot_id": self.incarnation_boot_id,
@@ -187,7 +193,10 @@ class DestructiveGrant:
             issued_at=float(str(data["issued_at"])),
             expires_at=float(str(data["expires_at"])),
             nonce=str(data["nonce"]),
-            binding_sha256=str(data["binding_sha256"]),
+            auth_tag=str(data["auth_tag"]),
+            authority_generation=str(data["authority_generation"]),
+            receipt_id=str(data["receipt_id"]),
+            schema_version=int(str(data.get("schema_version", 1))),
             authorization_evidence=dict(data.get("authorization_evidence") or {}),
             incarnation_product_uuid=str(data.get("incarnation_product_uuid") or ""),
             incarnation_boot_id=str(data.get("incarnation_boot_id") or ""),
@@ -290,8 +299,11 @@ def validate_operation(operation: str) -> None:
         raise GrantError(f"operation {operation!r} is not supported")
 
 
-def _binding_sha256(
+def _authenticate_grant(
+    *,
+    schema_version: int,
     grant_id: str,
+    receipt_id: str,
     operation: str,
     vm_id: str,
     hostname: str,
@@ -300,45 +312,91 @@ def _binding_sha256(
     label: str,
     subject: str,
     session_id: str,
-    nonce: str,
+    turn_id: str,
+    tool_call_id: str,
     issued_at: float,
     expires_at: float,
-    evidence: Dict[str, object],
+    nonce: str,
     incarnation_product_uuid: str,
     incarnation_boot_id: str,
     incarnation_hostname: str,
+    evidence: Optional[Dict[str, object]] = None,
 ) -> str:
-    """Canonical binding over the FULL grant identity.
+    """Authenticate the FULL immutable grant identity with the process-local
+    authority provider (keyed HMAC, never an unkeyed SHA-256).
 
-    Covers the grant id itself (a clone under a second UUID breaks the
-    hash even when the embedded id is rewritten), the operation tuple, the
-    human authorization evidence, the VM incarnation (durable generation:
-    product_uuid + boot_id + hostname), and the exact validity window
-    (``issued_at``/``expires_at``).  Any tamper — clone, TTL extension,
-    evidence swap, incarnation swap — breaks the recomputed hash and is
-    treated as DENY (review #100694 blocker 1; #90144/#90145).
+    Covers the grant id itself (a clone under a second UUID breaks the tag
+    even when the embedded id is rewritten), the receipt id (a grant minted
+    from a different human receipt is rejected), the operation tuple, the VM
+    incarnation (durable generation: product_uuid + boot_id + hostname), and
+    the exact validity window (``issued_at``/``expires_at``).  Any tamper —
+    clone, TTL extension, receipt swap, incarnation swap — breaks the
+    recomputed tag and is treated as DENY (review #100694 blocker 1;
+    #90144/#90145).
     """
-    canonical = "|".join(
-        [
-            grant_id,
-            operation,
-            vm_id,
-            hostname,
-            device,
-            fs_type,
-            label,
-            subject,
-            session_id,
-            nonce,
-            repr(issued_at),
-            repr(expires_at),
-            json.dumps(evidence, sort_keys=True, separators=(",", ":")),
-            incarnation_product_uuid,
-            incarnation_boot_id,
-            incarnation_hostname,
-        ]
+    from tools.grant_authority import canonical_grant_payload, get_authority
+
+    payload = canonical_grant_payload(
+        schema_version=schema_version,
+        grant_id=grant_id,
+        receipt_id=receipt_id,
+        operation=operation,
+        vm_id=vm_id,
+        hostname=hostname,
+        product_uuid=incarnation_product_uuid,
+        boot_id=incarnation_boot_id,
+        device=device,
+        fs_type=fs_type,
+        label=label,
+        authorization_subject=subject,
+        authorization_source="USER",
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+        authorization_evidence=evidence,
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return get_authority().authenticate(payload)
+
+
+def _verify_grant_authenticity(grant: "DestructiveGrant") -> bool:
+    """Recompute the authority tag over the grant's immutable fields and
+    compare in constant time.
+
+    The provider generation is part of the check: a grant minted by a
+    different process (or before a restart) has a different generation and
+    fails here, so grants are process-bound capabilities.
+    """
+    from tools.grant_authority import canonical_grant_payload, get_authority
+
+    authority = get_authority()
+    if grant.authority_generation != authority.generation:
+        return False
+    payload = canonical_grant_payload(
+        schema_version=grant.schema_version,
+        grant_id=grant.grant_id,
+        receipt_id=grant.receipt_id,
+        operation=grant.operation,
+        vm_id=grant.vm_id,
+        hostname=grant.hostname,
+        product_uuid=grant.incarnation_product_uuid,
+        boot_id=grant.incarnation_boot_id,
+        device=grant.device,
+        fs_type=grant.fs_type,
+        label=grant.label,
+        authorization_subject=grant.authorization_subject,
+        authorization_source=grant.authorization_source,
+        session_id=grant.session_id,
+        turn_id=str((grant.authorization_evidence or {}).get("turn_id", "")),
+        tool_call_id=str((grant.authorization_evidence or {}).get("tool_call_id", "")),
+        issued_at=grant.issued_at,
+        expires_at=grant.expires_at,
+        nonce=grant.nonce,
+        authorization_evidence=grant.authorization_evidence,
+    )
+    return authority.verify(payload, grant.auth_tag)
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +447,7 @@ def issue_grant(
     label: str,
     authorization_subject: str,
     session_id: str,
-    authorization_evidence: Dict[str, object],
+    receipt_id: str,
     incarnation_product_uuid: str,
     incarnation_boot_id: str,
     incarnation_hostname: str,
@@ -401,13 +459,16 @@ def issue_grant(
     in a module that no tool handler imports, and the CLI subcommand that
     wraps it runs in the user's own shell.
 
-    ``authorization_evidence`` is the correlated human approval decision
-    (request_id + request_digest + decision + principal + surface) produced
-    by the host approval transport; ``incarnation_product_uuid`` /
+    ``receipt_id`` is the id of a correlated human approval receipt produced
+    by ``tools.grant_authority.request_destructive_grant_approval``.  The
+    receipt is consumed atomically here (one-shot: the same receipt cannot
+    issue a second grant).  ``incarnation_product_uuid`` /
     ``incarnation_boot_id`` / ``incarnation_hostname`` are the durable VM
     generation captured at issue time (review #100694 blocker 1 + blocker 3;
     #90144/#90145).
     """
+    from tools.grant_authority import ReceiptError, consume_receipt, get_authority
+
     validate_operation(operation)
     validate_vm_id(vm_id)
     validate_device(device)
@@ -423,16 +484,24 @@ def issue_grant(
     ttl_seconds = min(ttl_seconds, MAX_TTL_SECONDS)
 
     # B1: a grant is only minted from a correlated, one-shot human decision.
-    if not isinstance(authorization_evidence, dict) or not authorization_evidence:
-        raise GrantError("authorization_evidence is required (correlated human decision)")
-    for key in ("request_id", "request_digest", "decision", "principal", "surface"):
-        if not authorization_evidence.get(key):
-            raise GrantError(f"authorization_evidence.{key} is required")
-    if authorization_evidence.get("decision") != "once":
+    # The receipt is produced by the approval layer AFTER an explicit human
+    # "approve once"; the caller never supplies a free-form evidence dict.
+    try:
+        receipt = consume_receipt(receipt_id)
+    except ReceiptError as exc:
+        raise GrantError(str(exc)) from exc
+    if receipt.operation != operation or receipt.vm_id != vm_id:
         raise GrantError(
-            "authorization_evidence.decision must be 'once' "
-            "(a one-shot grant cannot be minted from a session/permanent approval)"
+            "receipt does not match the requested operation/vm "
+            "(receipt replay or mismatch denied)"
         )
+    if receipt.device != device or receipt.fs_type != fs_type or receipt.label != label:
+        raise GrantError(
+            "receipt does not match the requested device/fs/label "
+            "(receipt replay or mismatch denied)"
+        )
+    if receipt.expires_at < time.time():
+        raise GrantError("receipt expired (human approval is no longer current)")
 
     # B3: the durable VM incarnation must be captured at issue time.
     if not isinstance(incarnation_product_uuid, str) or not incarnation_product_uuid:
@@ -446,12 +515,28 @@ def issue_grant(
     now = time.time()
     nonce = secrets.token_hex(16)
     grant_id = str(uuid.uuid4())
-    binding = _binding_sha256(
-        grant_id, operation, vm_id, hostname, device, fs_type, label,
-        authorization_subject, session_id, nonce,
-        now, now + ttl_seconds,
-        authorization_evidence, incarnation_product_uuid,
-        incarnation_boot_id, incarnation_hostname,
+    authority = get_authority()
+    auth_tag = _authenticate_grant(
+        schema_version=1,
+        grant_id=grant_id,
+        receipt_id=receipt.receipt_id,
+        operation=operation,
+        vm_id=vm_id,
+        hostname=hostname,
+        device=device,
+        fs_type=fs_type,
+        label=label,
+        subject=authorization_subject,
+        session_id=session_id,
+        turn_id=receipt.turn_id,
+        tool_call_id=receipt.tool_call_id,
+        issued_at=now,
+        expires_at=now + ttl_seconds,
+        nonce=nonce,
+        incarnation_product_uuid=incarnation_product_uuid,
+        incarnation_boot_id=incarnation_boot_id,
+        incarnation_hostname=incarnation_hostname,
+        evidence=receipt.to_dict(),
     )
     grant = DestructiveGrant(
         grant_id=grant_id,
@@ -467,8 +552,11 @@ def issue_grant(
         issued_at=now,
         expires_at=now + ttl_seconds,
         nonce=nonce,
-        binding_sha256=binding,
-        authorization_evidence=dict(authorization_evidence),
+        auth_tag=auth_tag,
+        authority_generation=authority.generation,
+        receipt_id=receipt.receipt_id,
+        schema_version=1,
+        authorization_evidence=dict(receipt.to_dict()),
         incarnation_product_uuid=incarnation_product_uuid,
         incarnation_boot_id=incarnation_boot_id,
         incarnation_hostname=incarnation_hostname,
@@ -499,11 +587,11 @@ def issue_grant(
             "session_id": session_id,
             "ttl_seconds": ttl_seconds,
             "expires_at": grant.expires_at,
-            "binding_sha256": binding,
+            "auth_tag": auth_tag,
+            "authority_generation": authority.generation,
+            "receipt_id": receipt.receipt_id,
             "incarnation_product_uuid": incarnation_product_uuid,
             "incarnation_boot_id": incarnation_boot_id,
-            "evidence_request_id": authorization_evidence.get("request_id"),
-            "evidence_decision": authorization_evidence.get("decision"),
         }
     )
     logger.info("destructive grant %s issued for %s %s", grant_id, operation, device)
@@ -549,19 +637,13 @@ def load_grant(grant_id: str) -> DestructiveGrant:
         raise GrantDeniedError(
             f"grant {grant_id!r} payload id mismatch (clone denied)"
         )
-    # Integrity: the stored binding must match the stored fields.  A tampered
-    # file (any field edited, TTL extended, evidence or incarnation swapped)
-    # fails here and is treated as DENY.
-    recomputed = _binding_sha256(
-        grant.grant_id, grant.operation, grant.vm_id, grant.hostname,
-        grant.device, grant.fs_type, grant.label, grant.authorization_subject,
-        grant.session_id, grant.nonce,
-        grant.issued_at, grant.expires_at,
-        grant.authorization_evidence, grant.incarnation_product_uuid,
-        grant.incarnation_boot_id, grant.incarnation_hostname,
-    )
-    if recomputed != grant.binding_sha256:
-        raise GrantDeniedError(f"grant {grant_id!r} integrity check failed (tampered)")
+    # Authenticity: the stored tag must authenticate the stored immutable
+    # fields under the process-local authority provider.  A tampered file
+    # (any field edited, TTL extended, receipt or incarnation swapped) fails
+    # here and is treated as DENY.  A grant minted by a different process
+    # (different provider generation) also fails: grants are process-bound.
+    if not _verify_grant_authenticity(grant):
+        raise GrantDeniedError(f"grant {grant_id!r} authentication failed (tampered)")
     return grant
 
 
@@ -749,17 +831,8 @@ def claim_grant(grant_id: str, execution_id: str) -> DestructiveGrant:
         raise GrantDeniedError(
             f"grant {grant_id!r} payload id mismatch (clone denied)"
         )
-    recomputed = _binding_sha256(
-        pre_grant.grant_id, pre_grant.operation, pre_grant.vm_id,
-        pre_grant.hostname, pre_grant.device, pre_grant.fs_type,
-        pre_grant.label, pre_grant.authorization_subject,
-        pre_grant.session_id, pre_grant.nonce,
-        pre_grant.issued_at, pre_grant.expires_at,
-        pre_grant.authorization_evidence, pre_grant.incarnation_product_uuid,
-        pre_grant.incarnation_boot_id, pre_grant.incarnation_hostname,
-    )
-    if recomputed != pre_grant.binding_sha256:
-        raise GrantDeniedError(f"grant {grant_id!r} integrity check failed (tampered)")
+    if not _verify_grant_authenticity(pre_grant):
+        raise GrantDeniedError(f"grant {grant_id!r} authentication failed (tampered)")
 
     claimed_path = live.with_suffix(".json.claimed")
     try:

@@ -28,6 +28,7 @@ disposable loop device.
 
 import json
 import time
+import uuid
 from unittest.mock import patch
 
 import pytest
@@ -51,6 +52,26 @@ def _issue(
     session_id="sess-1",
     ttl=600,
 ):
+    from tools.grant_authority import HumanApprovalReceipt, _store_receipt
+
+    now = time.time()
+    receipt = _store_receipt(
+        HumanApprovalReceipt(
+            receipt_id="rcpt-" + "1" * 28,
+            request_id="req-11111111111111111111111111111111",
+            request_digest="d" * 64,
+            session_id=session_id,
+            turn_id="turn-1",
+            tool_call_id="tool-1",
+            operation="CREATE_FILESYSTEM",
+            vm_id=vm_id,
+            device=device,
+            fs_type=fs_type,
+            label=label,
+            issued_at=now,
+            expires_at=now + ttl,
+        )
+    )
     return dg.issue_grant(
         operation="CREATE_FILESYSTEM",
         vm_id=vm_id,
@@ -60,17 +81,44 @@ def _issue(
         label=label,
         authorization_subject=subject,
         session_id=session_id,
-        authorization_evidence={
-            "request_id": "req-11111111111111111111111111111111",
-            "request_digest": "d" * 64,
-            "decision": "once",
-            "principal": "Ed",
-            "surface": "cli",
-        },
+        receipt_id=receipt.receipt_id,
         incarnation_product_uuid="uuid-A",
         incarnation_boot_id="boot-A",
         incarnation_hostname=hostname,
         ttl_seconds=ttl,
+    )
+
+
+def _make_receipt(
+    *,
+    operation="CREATE_FILESYSTEM",
+    vm_id="148",
+    device="/dev/sdb1",
+    fs_type="ext4",
+    label="MAILCOW_DOCKER",
+    session_id="sess-1",
+    ttl=600,
+):
+    """Mint a correlated human approval receipt in the process-local store."""
+    from tools.grant_authority import HumanApprovalReceipt, _store_receipt
+
+    now = time.time()
+    return _store_receipt(
+        HumanApprovalReceipt(
+            receipt_id="rcpt-" + uuid.uuid4().hex,
+            request_id="req-11111111111111111111111111111111",
+            request_digest="d" * 64,
+            session_id=session_id,
+            turn_id="turn-1",
+            tool_call_id="tool-1",
+            operation=operation,
+            vm_id=vm_id,
+            device=device,
+            fs_type=fs_type,
+            label=label,
+            issued_at=now,
+            expires_at=now + ttl,
+        )
     )
 
 
@@ -431,13 +479,7 @@ class TestDenyParameterMutation:
                 vm_id="148", hostname="hp-mail", device="/dev/sdb1",
                 fs_type="ext4", label="X",
                 authorization_subject="Ed", session_id="sess-1",
-                authorization_evidence={
-                    "request_id": "req-11111111111111111111111111111111",
-                    "request_digest": "d" * 64,
-                    "decision": "once",
-                    "principal": "Ed",
-                    "surface": "cli",
-                },
+                receipt_id=_make_receipt().receipt_id,
                 incarnation_product_uuid="uuid-A",
                 incarnation_boot_id="boot-A",
                 incarnation_hostname="hp-mail",

@@ -6,13 +6,14 @@ agent-generated authorization structurally impossible.
 
 Issuance now requires (review #100694 blockers 1 & 3):
 
-* a live, read-only capture of the VM incarnation (hostname + boot_id) via
-  the structured QGA adapter — the grant is bound to that durable generation;
-* a correlated human approval decision obtained through the host approval
-  transport (or an explicit interactive TTY confirmation when no plugin
-  transport is configured).  The evidence (request_id + request_digest +
-  decision + principal + surface) is bound into the grant and cannot be
-  forged by any model surface.
+* a live, read-only capture of the VM incarnation (hostname + boot_id +
+  product_uuid) via the structured QGA adapter — the grant is bound to that
+  durable generation;
+* a correlated human approval receipt obtained through the host approval
+  transport (or the standard interactive CLI approval prompt).  The receipt
+  is produced by the approval layer AFTER an explicit human ``approve once``
+  decision and is consumed one-shot at issuance; it cannot be forged by any
+  model surface.
 
 Usage:
 
@@ -28,105 +29,42 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import getpass
-import hashlib
 import json
 import sys
-import uuid
 from typing import Dict, List, Optional
 
 from tools.destructive_grants import GrantError
 
 
-def _obtain_human_evidence(args) -> Dict[str, object]:
-    """Obtain a correlated, one-shot human approval decision.
+def _obtain_human_receipt(args) -> Dict[str, object]:
+    """Obtain a correlated, one-shot human approval receipt.
 
-    Prefers the host approval transport (``_present_with_selected_transport``
-    from tools.approval), which returns a request_id + request_digest bound
-    to the exact request the human saw.  Falls back to an explicit
-    interactive TTY confirmation when no plugin transport is configured.
-
-    Refuses to mint when no interactive TTY is available and no transport
-    produced a decision: a grant must never be issued unattended.
+    Delegates to ``tools.grant_authority.request_destructive_grant_approval``,
+    which routes through the REAL approval transport (plugin transport,
+    gateway round-trip, or the standard interactive CLI prompt) and refuses
+    every bypass context (yolo, mode=off, cron, unattended, single-query).
+    The receipt is produced by the approval layer AFTER an explicit human
+    ``approve once`` decision; the caller never supplies a free-form
+    evidence dict.
     """
-    command = (
-        f"hermes grant issue --operation {args.operation} --vm {args.vm_id} "
-        f"--hostname {args.hostname} --device {args.device} "
-        f"--fs {args.fs_type} --label {args.label} "
-        f"--subject {args.subject} --session {args.session_id}"
-    )
-    description = (
-        f"One-shot destructive grant: CREATE_FILESYSTEM on VM {args.vm_id} "
-        f"({args.hostname}) device {args.device} as {args.fs_type} "
-        f"label {args.label}. This capability is consumed by exactly one "
-        f"governed operation and expires automatically."
+    from tools.grant_authority import (
+        ReceiptError,
+        request_destructive_grant_approval,
     )
 
     try:
-        from tools.approval import _present_with_selected_transport
-    except Exception:
-        _present_with_selected_transport = None
-
-    if _present_with_selected_transport is not None:
-        try:
-            presented = _present_with_selected_transport(
-                command=command,
-                description=description,
-                pattern_key="governed_grant_issue",
-                pattern_keys=("governed_grant_issue",),
-                session_key=args.session_id,
-                surface="cli",
-                allow_session=False,
-                allow_permanent=False,
-            )
-        except Exception as exc:
-            raise GrantError(f"approval transport failed: {exc}") from exc
-
-        if presented.get("selected"):
-            if presented.get("choice") != "once" or presented.get("failure"):
-                raise GrantError(
-                    "human approval not granted (transport decision: "
-                    f"{presented.get('choice') or presented.get('failure')})"
-                )
-            return {
-                "request_id": presented["request_id"],
-                "request_digest": presented["request_digest"],
-                "decision": "once",
-                "principal": getpass.getuser(),
-                "surface": "cli",
-            }
-
-    # Builtin path: explicit interactive confirmation on a real TTY.
-    if not sys.stdin.isatty():
-        raise GrantError(
-            "grant issue requires an interactive terminal (or a configured "
-            "approval transport): refusing unattended issuance"
+        receipt = request_destructive_grant_approval(
+            operation=args.operation,
+            vm_id=args.vm_id,
+            device=args.device,
+            fs_type=args.fs_type,
+            label=args.label,
+            session_id=args.session_id,
+            ttl_seconds=args.ttl,
         )
-    print("=" * 72, file=sys.stderr)
-    print("DESTRUCTIVE CAPABILITY GRANT — explicit human approval required", file=sys.stderr)
-    print("=" * 72, file=sys.stderr)
-    print(f"operation : {args.operation}", file=sys.stderr)
-    print(f"vm        : {args.vm_id} ({args.hostname})", file=sys.stderr)
-    print(f"device    : {args.device}", file=sys.stderr)
-    print(f"fs_type   : {args.fs_type}", file=sys.stderr)
-    print(f"label     : {args.label}", file=sys.stderr)
-    print(f"session   : {args.session_id}", file=sys.stderr)
-    print(f"ttl       : {args.ttl}s (max {3600}s)", file=sys.stderr)
-    print("=" * 72, file=sys.stderr)
-    answer = input("Type APPROVE to issue this one-shot grant, anything else to cancel: ")
-    if answer.strip() != "APPROVE":
-        raise GrantError("grant issuance cancelled by the user")
-
-    canonical = "|".join(
-        [command, description, args.session_id, getpass.getuser()]
-    )
-    return {
-        "request_id": str(uuid.uuid4()),
-        "request_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        "decision": "once",
-        "principal": getpass.getuser(),
-        "surface": "cli",
-    }
+    except ReceiptError as exc:
+        raise GrantError(str(exc)) from exc
+    return receipt.to_dict()
 
 
 def build_grant_parser(subparsers, *, cmd_grant=None) -> None:
@@ -198,8 +136,8 @@ def run_grant_command(args) -> int:
                 )
                 return 2
 
-            # B1: correlated human approval decision.
-            evidence = _obtain_human_evidence(args)
+            # B1: correlated human approval receipt (one-shot).
+            receipt = _obtain_human_receipt(args)
 
             grant = issue_grant(
                 operation=args.operation,
@@ -210,7 +148,7 @@ def run_grant_command(args) -> int:
                 label=args.label,
                 authorization_subject=args.subject,
                 session_id=args.session_id,
-                authorization_evidence=evidence,
+                receipt_id=receipt["receipt_id"],
                 incarnation_product_uuid=identity["product_uuid"],
                 incarnation_boot_id=identity["boot_id"],
                 incarnation_hostname=identity["hostname"],

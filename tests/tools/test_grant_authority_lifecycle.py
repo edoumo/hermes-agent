@@ -25,6 +25,7 @@ B3  Durable generation fencing:
 import json
 import threading
 import time
+import uuid
 from unittest.mock import patch
 
 import pytest
@@ -48,6 +49,40 @@ _EVIDENCE = {
 _INCARNATION = {"hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A"}
 
 
+def _make_receipt(
+    *,
+    operation="CREATE_FILESYSTEM",
+    vm_id="148",
+    device="/dev/sdb1",
+    fs_type="ext4",
+    label="MAILCOW_DOCKER",
+    session_id="sess-1",
+    ttl=600,
+):
+    """Mint a correlated human approval receipt in the process-local store
+    (the same store the approval layer writes to)."""
+    from tools.grant_authority import HumanApprovalReceipt, _store_receipt
+
+    now = time.time()
+    return _store_receipt(
+        HumanApprovalReceipt(
+            receipt_id="rcpt-" + uuid.uuid4().hex,
+            request_id="req-11111111111111111111111111111111",
+            request_digest="d" * 64,
+            session_id=session_id,
+            turn_id="turn-1",
+            tool_call_id="tool-1",
+            operation=operation,
+            vm_id=vm_id,
+            device=device,
+            fs_type=fs_type,
+            label=label,
+            issued_at=now,
+            expires_at=now + ttl,
+        )
+    )
+
+
 def _issue(
     *,
     device="/dev/sdb1",
@@ -58,9 +93,13 @@ def _issue(
     subject="Ed",
     session_id="sess-1",
     ttl=600,
-    evidence=None,
+    receipt=None,
     incarnation=None,
 ):
+    receipt = receipt if receipt is not None else _make_receipt(
+        device=device, fs_type=fs_type, label=label, vm_id=vm_id,
+        session_id=session_id, ttl=ttl,
+    )
     return dg.issue_grant(
         operation="CREATE_FILESYSTEM",
         vm_id=vm_id,
@@ -70,7 +109,7 @@ def _issue(
         label=label,
         authorization_subject=subject,
         session_id=session_id,
-        authorization_evidence=evidence if evidence is not None else _EVIDENCE,
+        receipt_id=receipt.receipt_id,
         incarnation_product_uuid=(incarnation or _INCARNATION)["product_uuid"],
         incarnation_boot_id=(incarnation or _INCARNATION)["boot_id"],
         incarnation_hostname=(incarnation or _INCARNATION)["hostname"],
@@ -182,29 +221,35 @@ def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None,
 
 
 class TestB1IssuanceEvidence:
-    def test_issue_requires_authorization_evidence(self):
+    def test_issue_requires_receipt(self):
         with pytest.raises(dg.GrantError):
             dg.issue_grant(
                 operation="CREATE_FILESYSTEM",
                 vm_id="148", hostname="hp-mail", device="/dev/sdb1",
                 fs_type="ext4", label="X",
                 authorization_subject="Ed", session_id="sess-1",
-                authorization_evidence={},
+                receipt_id="no-such-receipt",
                 incarnation_product_uuid="uuid-A",
                 incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
             )
 
-    def test_issue_rejects_non_once_decision(self):
-        bad = dict(_EVIDENCE, decision="always")
+    def test_issue_rejects_unknown_receipt(self):
         with pytest.raises(dg.GrantError):
-            _issue(evidence=bad)
+            dg.issue_grant(
+                operation="CREATE_FILESYSTEM",
+                vm_id="148", hostname="hp-mail", device="/dev/sdb1",
+                fs_type="ext4", label="X",
+                authorization_subject="Ed", session_id="sess-1",
+                receipt_id="rcpt-00000000000000000000000000000000",
+                incarnation_product_uuid="uuid-A",
+                incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
+            )
 
-    def test_issue_rejects_uncorrelated_evidence(self):
-        for missing in ("request_id", "request_digest"):
-            bad = dict(_EVIDENCE)
-            del bad[missing]
-            with pytest.raises(dg.GrantError):
-                _issue(evidence=bad)
+    def test_issue_rejects_mismatched_receipt(self):
+        # Receipt for a different device: issuance must be denied.
+        receipt = _make_receipt(device="/dev/sdc1")
+        with pytest.raises(dg.GrantError):
+            _issue(receipt=receipt)
 
     def test_issue_requires_incarnation(self):
         with pytest.raises(dg.GrantError):
@@ -213,7 +258,7 @@ class TestB1IssuanceEvidence:
                 vm_id="148", hostname="hp-mail", device="/dev/sdb1",
                 fs_type="ext4", label="X",
                 authorization_subject="Ed", session_id="sess-1",
-                authorization_evidence=_EVIDENCE,
+                receipt_id=_make_receipt().receipt_id,
                 incarnation_product_uuid="",
                 incarnation_boot_id="boot-A", incarnation_hostname="hp-mail",
             )
@@ -225,18 +270,27 @@ class TestB1IssuanceEvidence:
                 vm_id="148", hostname="hp-mail", device="/dev/sdb1",
                 fs_type="ext4", label="X",
                 authorization_subject="Ed", session_id="sess-1",
-                authorization_evidence=_EVIDENCE,
+                receipt_id=_make_receipt().receipt_id,
                 incarnation_product_uuid="uuid-A",
                 incarnation_boot_id="", incarnation_hostname="hp-mail",
             )
 
-    def test_evidence_is_persisted_and_bound(self):
+    def test_receipt_is_persisted_and_bound(self):
         grant = _issue()
-        assert grant.authorization_evidence["request_id"] == _EVIDENCE["request_id"]
+        assert grant.authorization_evidence["request_id"] == "req-11111111111111111111111111111111"
         assert grant.incarnation_boot_id == "boot-A"
-        # Reload from disk: binding still valid (no tamper).
+        # Reload from disk: auth tag still valid (no tamper).
         loaded = dg.load_grant(grant.grant_id)
-        assert loaded.binding_sha256 == grant.binding_sha256
+        assert loaded.auth_tag == grant.auth_tag
+        assert loaded.authority_generation == grant.authority_generation
+
+    def test_receipt_is_one_shot(self):
+        """The same receipt cannot issue a second grant (replay denied)."""
+        receipt = _make_receipt()
+        g1 = _issue(receipt=receipt)
+        assert g1.receipt_id == receipt.receipt_id
+        with pytest.raises(dg.GrantError):
+            _issue(receipt=receipt)  # already consumed
 
 
 class TestB1CloneAndTamper:
@@ -274,7 +328,18 @@ class TestB1CloneAndTamper:
         grant = _issue()
         path = dg._grant_path(grant.grant_id)
         data = json.loads(path.read_text())
-        data["authorization_evidence"] = dict(_EVIDENCE, principal="Mallory")
+        data["authorization_evidence"] = dict(
+            data["authorization_evidence"], principal="Mallory"
+        )
+        path.write_text(json.dumps(data))
+        with pytest.raises(dg.GrantDeniedError):
+            dg.load_grant(grant.grant_id)
+
+    def test_receipt_swap_denied(self):
+        grant = _issue()
+        path = dg._grant_path(grant.grant_id)
+        data = json.loads(path.read_text())
+        data["receipt_id"] = "rcpt-" + "2" * 28
         path.write_text(json.dumps(data))
         with pytest.raises(dg.GrantDeniedError):
             dg.load_grant(grant.grant_id)

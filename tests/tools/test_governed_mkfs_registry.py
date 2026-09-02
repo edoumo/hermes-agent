@@ -5,6 +5,13 @@ The registry's AST-based discovery only imports modules with a top-level
 governed path silently disappears from the model's toolset — which would
 be a safety regression (the model would have no governed alternative and
 could be tempted to bypass).  These tests pin the discovery contract.
+
+Process-boundary contract (review #100694, 2026-09-02): the governed
+handler is the ONLY legitimate issuer — it runs in the long-lived Hermes
+process, asks the human for an explicit one-shot approval, and mints the
+grant with the SAME process-local authority that claims and verifies it.
+The model-facing schema therefore exposes the target tuple only (no
+grant_id): the model can request, never self-grant.
 """
 
 from pathlib import Path
@@ -25,20 +32,31 @@ def test_governed_mkfs_registered_after_import():
     assert entry is not None
     assert entry.name == "governed_mkfs"
     assert entry.toolset == "terminal"
-    # The schema must expose only structured fields, never a free shell string.
+    # The schema must expose only structured fields, never a free shell
+    # string, and NO grant_id: the model requests the target tuple, the
+    # process mints the grant after human approval.
     props = entry.schema["parameters"]["properties"]
-    assert set(props) == {"grant_id", "vm_id", "device", "fs_type", "label"}
+    assert set(props) == {"vm_id", "device", "fs_type", "label"}
     assert entry.schema["parameters"]["required"] == [
-        "grant_id", "vm_id", "device", "fs_type", "label",
+        "vm_id", "device", "fs_type", "label",
     ]
 
 
-def test_governed_mkfs_handler_never_issues_grants():
-    """The handler can verify/consume but structurally cannot issue."""
+def test_governed_mkfs_handler_is_the_in_process_issuer():
+    """The handler is the legitimate issuer: it requests the human
+    approval and mints the grant in the consumer process (same authority
+    generation).  The model-facing schema has no grant_id, so a forged or
+    externally-minted grant cannot even be referenced."""
     import inspect
 
     import tools.governed_mkfs_tool as gmt
 
     src = inspect.getsource(gmt._handle_governed_mkfs)
-    assert "issue_grant" not in src
-    assert "authorization_subject" not in src
+    # The handler drives the full approval -> issue -> claim -> workflow.
+    assert "request_destructive_grant_approval" in src
+    assert "issue_grant" in src
+    assert "claim_grant" in src
+    assert "settle_grant" in src
+    # No grant_id in the schema: the model cannot point the tool at a
+    # pre-minted grant.
+    assert "grant_id" not in gmt.GOVERNED_MKFS_SCHEMA["parameters"]["properties"]

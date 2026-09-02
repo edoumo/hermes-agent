@@ -1,12 +1,21 @@
-"""RED tests — review #100694 blockers 1-3 (andrexibiza, 2026-09-01).
+"""RED tests — review #100694 blockers 1-3 (andrexibiza, 2026-09-01/02).
+
+Process-boundary contract (review #100694, 2026-09-02):
+
+    model requests (vm_id, device, fs_type, label) in a live session
+    -> process captures trusted guest identity
+    -> human approves the EXACT observed tuple + incarnation
+    -> grant minted IN THE CONSUMER PROCESS (same authority generation)
+    -> atomic claim -> sink fencing -> prechecks -> TOCTOU -> exec ->
+       postcheck -> settlement
 
 B1  Authority provenance + grant integrity:
-    - issuance requires a correlated human approval decision (evidence)
-    - issuance requires a captured VM incarnation (boot_id)
+    - issuance requires a correlated human approval receipt (one-shot)
+    - the receipt binds operation, target, session AND incarnation
+    - identity observed BEFORE approval == identity approved == grant
     - clone under a second UUID is denied (path-ID == payload-ID)
-    - TTL extension / evidence swap / incarnation swap are denied (binding
-      covers identity AND duration)
-    - self-mint from a model surface is refused (non-TTY CLI gate)
+    - TTL extension / evidence swap / incarnation swap are denied
+    - the CLI cannot mint a grant (hard-fail, no local issuance)
 
 B2  Claim/settlement lifecycle:
     - atomic claim BEFORE the first effect; one winner under concurrency
@@ -37,16 +46,11 @@ from tools.governed_mkfs_tool import _handle_governed_mkfs
 # Helpers
 # ---------------------------------------------------------------------------
 
-_EVIDENCE = {
-    "request_id": "req-11111111111111111111111111111111",
-    "request_digest": "d" * 64,
-    "decision": "once",
-    "principal": "operator",
-    "surface": "cli",
-    "decided_at": 1756800000.0,
+_INCARNATION = {
+    "hostname": "storage-guest",
+    "boot_id": "boot-A",
+    "product_uuid": "uuid-A",
 }
-
-_INCARNATION = {"hostname": "storage-guest", "boot_id": "boot-A", "product_uuid": "uuid-A"}
 
 
 def _make_receipt(
@@ -58,11 +62,13 @@ def _make_receipt(
     label="DATA",
     session_id="sess-1",
     ttl=600,
+    incarnation=None,
 ):
     """Mint a correlated human approval receipt in the process-local store
     (the same store the approval layer writes to)."""
     from tools.grant_authority import HumanApprovalReceipt, _store_receipt
 
+    inc = incarnation if incarnation is not None else _INCARNATION
     now = time.time()
     return _store_receipt(
         HumanApprovalReceipt(
@@ -77,6 +83,9 @@ def _make_receipt(
             device=device,
             fs_type=fs_type,
             label=label,
+            incarnation_product_uuid=inc["product_uuid"],
+            incarnation_boot_id=inc["boot_id"],
+            incarnation_hostname=inc["hostname"],
             issued_at=now,
             expires_at=now + ttl,
         )
@@ -98,7 +107,7 @@ def _issue(
 ):
     receipt = receipt if receipt is not None else _make_receipt(
         device=device, fs_type=fs_type, label=label, vm_id=vm_id,
-        session_id=session_id, ttl=ttl,
+        session_id=session_id, ttl=ttl, incarnation=incarnation,
     )
     return dg.issue_grant(
         operation="CREATE_FILESYSTEM",
@@ -161,12 +170,13 @@ def _postcheck_ok(fs_type="ext4", label="DATA"):
     }
 
 
-def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="DATA",
+def _call(*, device="/dev/sdb1", fs_type="ext4", label="DATA",
           vm_id="101", session_id="sess-1"):
+    """Drive the governed handler end-to-end (approval -> issue -> claim ->
+    workflow) exactly as the model-facing tool does."""
     return json.loads(
         _handle_governed_mkfs(
             {
-                "grant_id": grant_id,
                 "vm_id": vm_id,
                 "device": device,
                 "fs_type": fs_type,
@@ -177,24 +187,70 @@ def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="DATA",
     )
 
 
+def _mock_approval(decision="once", incarnation=None):
+    """Patch the human approval gate: return a receipt bound to the EXACT
+    incarnation the handler observed (the mock mirrors the real gate, which
+    receives the observed identity and binds it into the receipt)."""
+    from tools.grant_authority import HumanApprovalReceipt, _store_receipt
+
+    def _fake_request(**kwargs):
+        if decision != "once":
+            from tools.grant_authority import ReceiptError
+
+            raise ReceiptError("human approval not granted")
+        now = time.time()
+        return _store_receipt(
+            HumanApprovalReceipt(
+                receipt_id="rcpt-" + uuid.uuid4().hex,
+                request_id="req-" + uuid.uuid4().hex,
+                request_digest="d" * 64,
+                session_id=kwargs["session_id"],
+                turn_id="turn-1",
+                tool_call_id="tool-1",
+                operation=kwargs["operation"],
+                vm_id=kwargs["vm_id"],
+                device=kwargs["device"],
+                fs_type=kwargs["fs_type"],
+                label=kwargs["label"],
+                incarnation_product_uuid=kwargs["incarnation_product_uuid"],
+                incarnation_boot_id=kwargs["incarnation_boot_id"],
+                incarnation_hostname=kwargs["incarnation_hostname"],
+                issued_at=now,
+                expires_at=now + kwargs["ttl_seconds"],
+            )
+        )
+
+    return patch("tools.governed_mkfs_tool.request_destructive_grant_approval",
+                 side_effect=_fake_request)
+
+
 def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None,
-              identity=None, exec_side_effect=None):
+              identity=None, identity_after=None, exec_side_effect=None):
     """Patch the structured QGA boundary with deterministic payloads.
 
     ``qga_prechecks`` is called twice (precheck then TOCTOU recheck); when
     ``recheck`` is provided it is returned on the second call.  ``identity``
-    is the incarnation payload returned by ``qga_guest_identity`` at the sink.
+    is the incarnation payload returned by ``qga_guest_identity`` at the
+    initial capture; ``identity_after`` (if given) is returned on the second
+    (sink) read — used to witness an incarnation replacement between
+    approval and effect.
     """
     prechecks = prechecks if prechecks is not None else _clean_prechecks()
     recheck = recheck if recheck is not None else prechecks
     exec_result = exec_result if exec_result is not None else _exec_ok()
     postcheck = postcheck if postcheck is not None else _postcheck_ok()
     identity = identity if identity is not None else dict(_INCARNATION)
-    calls = {"n": 0}
+    identity_after = identity_after if identity_after is not None else identity
+    pre_calls = {"n": 0}
+    id_calls = {"n": 0}
 
     def _prechecks(vm_id, device):
-        calls["n"] += 1
-        return recheck if calls["n"] >= 2 else prechecks
+        pre_calls["n"] += 1
+        return recheck if pre_calls["n"] >= 2 else prechecks
+
+    def _identity(vm_id):
+        id_calls["n"] += 1
+        return dict(identity_after if id_calls["n"] >= 2 else identity)
 
     def _exec(vm_id, device, fs_type, label):
         if exec_side_effect is not None:
@@ -209,7 +265,7 @@ def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None,
     return patch.multiple(
         "tools.governed_mkfs_tool",
         qga_prechecks=_prechecks,
-        qga_guest_identity=lambda vm_id: dict(identity),
+        qga_guest_identity=_identity,
         qga_create_filesystem=_exec,
         qga_postcheck=_postcheck,
     )
@@ -261,6 +317,19 @@ class TestB1IssuanceEvidence:
         # not burn the receipt (the human decision stays usable).
         grant = _issue(receipt=receipt, session_id="sess-A")
         assert grant.session_id == "sess-A"
+
+    def test_issue_rejects_receipt_incarnation_mismatch(self):
+        """A receipt approved for generation A must never mint a grant for
+        generation B (identity observed before approval == grant identity)."""
+        receipt = _make_receipt(incarnation={
+            "hostname": "storage-guest", "boot_id": "boot-A",
+            "product_uuid": "uuid-A",
+        })
+        with pytest.raises(dg.GrantError):
+            _issue(receipt=receipt, incarnation={
+                "hostname": "storage-guest", "boot_id": "boot-B",
+                "product_uuid": "uuid-A",
+            })
 
     def test_grant_expiry_never_exceeds_receipt_expiry(self):
         """grant.expires_at <= receipt.expires_at always (no implicit
@@ -451,9 +520,12 @@ class TestB2Claim:
 
 class TestB2Concurrency:
     def test_concurrent_callers_single_winner(self):
-        grant = _issue()
+        """Two concurrent model calls racing on the SAME grant: one winner,
+        exactly one qga_create_filesystem call.  The claim is the atomic
+        reservation point (review #100694 blocker 2)."""
         from tools import governed_mkfs_tool as gmt
 
+        shared_grant = _issue()
         barrier = threading.Barrier(2)
         real_claim = gmt.claim_grant
         exec_calls = []
@@ -465,18 +537,22 @@ class TestB2Concurrency:
         results = {}
 
         def run():
-            results[threading.get_ident()] = _call(grant.grant_id)
+            results[threading.get_ident()] = _call()
 
-        # Patch ONCE in the main thread: the mock must stay active for the
-        # whole race, including while the winner runs the post-claim flow.
-        with _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
-            with patch.object(gmt, "claim_grant", side_effect=racing_claim):
-                t1 = threading.Thread(target=run)
-                t2 = threading.Thread(target=run)
-                t1.start()
-                t2.start()
-                t1.join(10)
-                t2.join(10)
+        # Both callers race on the same grant: issue_grant is patched to
+        # return the shared grant, so the claim is the single contention
+        # point.  Patch ONCE in the main thread: the mock must stay active
+        # for the whole race, including while the winner runs the
+        # post-claim flow.
+        with _mock_approval(), _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
+            with patch.object(gmt, "issue_grant", return_value=shared_grant):
+                with patch.object(gmt, "claim_grant", side_effect=racing_claim):
+                    t1 = threading.Thread(target=run)
+                    t2 = threading.Thread(target=run)
+                    t1.start()
+                    t2.start()
+                    t1.join(10)
+                    t2.join(10)
         assert not t1.is_alive() and not t2.is_alive()
 
         decisions = sorted(r["decision"] for r in results.values())
@@ -488,84 +564,65 @@ class TestB2Concurrency:
         # claim, as a replay (grant_denied).  Both are legitimate DENYs.
         assert loser["reason"] in ("claim_lost", "grant_denied")
 
-    def test_preclaimed_grant_denied_before_any_qga(self):
-        grant = _issue()
-        dg.claim_grant(grant.grant_id, "exec-other")
-        exec_calls = []
-        with _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
-            result = _call(grant.grant_id)
-        assert result["decision"] == "DENY"
-        assert result["reason"] == "claim_lost"
-        assert exec_calls == []
-
 
 class TestB2SettlementOutcomes:
     def test_precheck_failure_settles_failed_pre_effect(self):
-        grant = _issue()
         prechecks = _clean_prechecks()
         prechecks["mounted"] = True
-        with _mock_qga(prechecks=prechecks):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(prechecks=prechecks):
+            result = _call()
         assert result["decision"] == "DENY"
         assert result["outcome"] == "failed_pre_effect"
-        assert dg.get_grant_state(grant.grant_id) == "settled:failed_pre_effect"
+        # The grant was minted in-process and settled: no live grant remains.
+        assert dg.list_grants() == []
 
     def test_toctou_failure_settles_failed_pre_effect(self):
-        grant = _issue()
         recheck = _clean_prechecks()
         recheck["major_minor"] = "8:18"
-        with _mock_qga(recheck=recheck):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(recheck=recheck):
+            result = _call()
         assert result["decision"] == "DENY"
         assert result["outcome"] == "failed_pre_effect"
 
     def test_exec_nonzero_settles_indeterminate(self):
-        grant = _issue()
         exec_result = _exec_ok()
         exec_result["exit_code"] = 1
         exec_result["err_data"] = "mkfs.ext4: Device or resource busy"
-        with _mock_qga(exec_result=exec_result):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(exec_result=exec_result):
+            result = _call()
         assert result["decision"] == "INDETERMINATE"
         assert result["outcome"] == "indeterminate"
-        assert dg.get_grant_state(grant.grant_id) == "settled:indeterminate"
         # Never returns to the pool: replay is impossible.
-        with pytest.raises(dg.GrantConsumedError):
-            dg.load_grant(grant.grant_id)
+        assert dg.list_grants() == []
 
     def test_postcheck_loss_settles_indeterminate(self):
-        grant = _issue()
         from tools.qga_structured import QgaError
 
         def _boom(vm_id, device, fs_type, label):
             raise QgaError("postcheck transport lost")
 
-        with _mock_qga(postcheck=_boom):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(postcheck=_boom):
+            result = _call()
         assert result["decision"] == "INDETERMINATE"
         assert result["outcome"] == "indeterminate"
-        assert dg.get_grant_state(grant.grant_id) == "settled:indeterminate"
 
     def test_postcheck_mismatch_settles_indeterminate(self):
-        grant = _issue()
-        with _mock_qga(postcheck=_postcheck_ok(fs_type="xfs")):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(postcheck=_postcheck_ok(fs_type="xfs")):
+            result = _call()
         assert result["decision"] == "INDETERMINATE"
         assert result["outcome"] == "indeterminate"
 
     def test_success_settles_completed(self):
-        grant = _issue()
-        with _mock_qga():
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga():
+            result = _call()
         assert result["decision"] == "ALLOW"
         assert result["outcome"] == "completed"
-        assert dg.get_grant_state(grant.grant_id) == "settled:completed"
+        assert dg.list_grants() == []
 
     def test_settlement_failure_blocks_blind_replay(self):
         """Settlement persistence failure after a possible mutation: the
         grant stays CLAIMED (never returns to LIVE), so a blind replay is
         impossible even though the settlement rename failed."""
-        grant = _issue()
         from tools import governed_mkfs_tool as gmt
 
         real_settle = gmt.settle_grant
@@ -575,18 +632,19 @@ class TestB2SettlementOutcomes:
                 raise dg.GrantError("simulated settlement persistence failure")
             return real_settle(grant_id, execution_id, outcome)
 
-        with _mock_qga():
+        with _mock_approval(), _mock_qga():
             with patch.object(gmt, "settle_grant", side_effect=failing_settle):
-                result = _call(grant.grant_id)
+                result = _call()
         assert result["decision"] == "INDETERMINATE"
         assert result["outcome"] == "indeterminate"
         # The grant is still claimed (in-flight), NOT live: no blind replay.
-        assert dg.get_grant_state(grant.grant_id) == "claimed"
+        grant_id = result["grant_id"]
+        assert dg.get_grant_state(grant_id) == "claimed"
         with pytest.raises(dg.GrantInFlightError):
-            dg.claim_grant(grant.grant_id, "exec-replay")
+            dg.claim_grant(grant_id, "exec-replay")
         with pytest.raises(dg.GrantInFlightError):
             dg.verify_grant(
-                grant.grant_id,
+                grant_id,
                 operation="CREATE_FILESYSTEM", vm_id="101", device="/dev/sdb1",
                 fs_type="ext4", label="DATA", session_id="sess-1",
             )
@@ -599,61 +657,69 @@ class TestB2SettlementOutcomes:
 
 class TestB3GenerationFencing:
     def test_incarnation_mismatch_denied_at_sink(self):
-        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
-                                    "product_uuid": "uuid-A"})
+        """The live guest changed generation between approval and sink
+        re-read: denied BEFORE any mutation."""
         exec_calls = []
-        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-B",
-                                  "product_uuid": "uuid-A"},
-                       exec_side_effect=lambda: exec_calls.append(1)):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(
+            identity={"hostname": "storage-guest", "boot_id": "boot-A",
+                      "product_uuid": "uuid-A"},
+            identity_after={"hostname": "storage-guest", "boot_id": "boot-B",
+                            "product_uuid": "uuid-A"},
+            exec_side_effect=lambda: exec_calls.append(1),
+        ):
+            result = _call()
         assert result["decision"] == "DENY"
         assert result["reason"] == "incarnation_changed"
         assert exec_calls == []
-        assert dg.get_grant_state(grant.grant_id) == "settled:failed_pre_effect"
+        assert result["outcome"] == "failed_pre_effect"
 
     def test_incarnation_match_allows(self):
-        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
-                                     "product_uuid": "uuid-A"})
-        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-A",
-                                 "product_uuid": "uuid-A"}):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(
+            identity={"hostname": "storage-guest", "boot_id": "boot-A",
+                      "product_uuid": "uuid-A"},
+        ):
+            result = _call()
         assert result["decision"] == "ALLOW"
 
     def test_aba_witness_generation_b_untouched(self):
         """A issued for gen A; VM replaced by gen B; A resumes -> B untouched."""
-        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
-                                    "product_uuid": "uuid-A"})
         exec_calls = []
-        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-B",
-                                 "product_uuid": "uuid-A"},
-                       exec_side_effect=lambda: exec_calls.append(1)):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(
+            identity={"hostname": "storage-guest", "boot_id": "boot-A",
+                      "product_uuid": "uuid-A"},
+            identity_after={"hostname": "storage-guest", "boot_id": "boot-B",
+                            "product_uuid": "uuid-A"},
+            exec_side_effect=lambda: exec_calls.append(1),
+        ):
+            result = _call()
         assert result["decision"] == "DENY"
         assert exec_calls == []
 
     def test_vm_replacement_denied_at_sink(self):
         """Same vm_id + same device + same hostname, NEW product_uuid:
         the grant for the old incarnation must not mutate the new VM."""
-        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
-                                    "product_uuid": "uuid-A"})
         exec_calls = []
-        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-A",
-                                 "product_uuid": "uuid-B"},
-                       exec_side_effect=lambda: exec_calls.append(1)):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(
+            identity={"hostname": "storage-guest", "boot_id": "boot-A",
+                      "product_uuid": "uuid-A"},
+            identity_after={"hostname": "storage-guest", "boot_id": "boot-A",
+                            "product_uuid": "uuid-B"},
+            exec_side_effect=lambda: exec_calls.append(1),
+        ):
+            result = _call()
         assert result["decision"] == "DENY"
         assert result["reason"] == "incarnation_changed"
         assert exec_calls == []
-        assert dg.get_grant_state(grant.grant_id) == "settled:failed_pre_effect"
+        assert result["outcome"] == "failed_pre_effect"
 
     def test_boot_id_in_toctou_snapshot(self):
-        grant = _issue(incarnation={"hostname": "storage-guest", "boot_id": "boot-A",
-                                    "product_uuid": "uuid-A"})
         recheck = _clean_prechecks()
         recheck["boot_id"] = "boot-B"
-        with _mock_qga(identity={"hostname": "storage-guest", "boot_id": "boot-A",
-                                 "product_uuid": "uuid-A"},
-                       recheck=recheck):
-            result = _call(grant.grant_id)
+        with _mock_approval(), _mock_qga(
+            identity={"hostname": "storage-guest", "boot_id": "boot-A",
+                      "product_uuid": "uuid-A"},
+            recheck=recheck,
+        ):
+            result = _call()
         assert result["decision"] == "DENY"
         assert result["reason"] == "toctou_identity_changed"

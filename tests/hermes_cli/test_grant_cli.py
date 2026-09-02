@@ -1,4 +1,11 @@
-"""CLI wiring tests for ``hermes grant`` (trusted user boundary)."""
+"""CLI wiring tests for ``hermes grant`` (process-boundary contract).
+
+``hermes grant issue`` is REFUSED: a short-lived CLI process cannot mint a
+grant the running Hermes process would accept (different authority
+generation).  Issuance happens exclusively inside the long-lived Hermes
+process via the governed tool.  ``list`` / ``revoke`` / ``audit`` remain
+available for operational visibility.
+"""
 
 import argparse
 import json
@@ -8,50 +15,11 @@ import uuid
 import pytest
 
 from hermes_cli.subcommands.grant import (
-    _obtain_human_receipt as _REAL_OBTAIN_HUMAN_RECEIPT,
     build_grant_parser,
     run_grant_command,
 )
 
 _IDENTITY = {"hostname": "storage-guest", "boot_id": "boot-A", "product_uuid": "uuid-A"}
-
-
-def _fake_receipt_dict():
-    from tools.grant_authority import HumanApprovalReceipt, _store_receipt
-
-    receipt = _store_receipt(
-        HumanApprovalReceipt(
-            receipt_id="rcpt-" + uuid.uuid4().hex,
-            request_id="req-11111111111111111111111111111111",
-            request_digest="d" * 64,
-            session_id="sess-1",
-            turn_id="turn-1",
-            tool_call_id="tool-1",
-            operation="CREATE_FILESYSTEM",
-            vm_id="101",
-            device="/dev/sdb1",
-            fs_type="ext4",
-            label="DATA",
-            issued_at=time.time(),
-            expires_at=time.time() + 600,
-        )
-    )
-    return receipt.to_dict()
-
-
-@pytest.fixture(autouse=True)
-def _mock_issue_boundaries(monkeypatch):
-    """The issue path now requires a live QGA incarnation capture and a
-    correlated human approval receipt; both are mocked in CLI tests."""
-    from hermes_cli.subcommands import grant as grant_mod
-
-    monkeypatch.setattr(
-        "tools.qga_structured.qga_guest_identity",
-        lambda vm_id: dict(_IDENTITY),
-    )
-    monkeypatch.setattr(
-        grant_mod, "_obtain_human_receipt", lambda args: _fake_receipt_dict()
-    )
 
 
 def _make_parser():
@@ -103,7 +71,12 @@ class TestGrantParser:
 
 
 class TestGrantCommand:
-    def test_issue_creates_grant_and_list_shows_it(self, capsys):
+    def test_issue_is_refused_no_grant_created(self, capsys):
+        """Track A: the CLI must NOT mint a grant.  ``hermes grant issue``
+        exits nonzero with an explicit message and creates nothing."""
+        from tools import destructive_grants as dg
+
+        before = len(dg.list_grants())
         args = _make_parser().parse_args(
             [
                 "grant", "issue",
@@ -118,117 +91,14 @@ class TestGrantCommand:
             ]
         )
         rc = run_grant_command(args)
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "grant_id=" in out
-        grant_id = out.split("grant_id=")[1].splitlines()[0].strip()
-
-        # list shows the live grant
-        list_args = _make_parser().parse_args(["grant", "list"])
-        capsys.readouterr()
-        rc = run_grant_command(list_args)
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert grant_id in out
-        assert "DATA" in out
-
-        # audit shows the issue event
-        audit_args = _make_parser().parse_args(["grant", "audit"])
-        capsys.readouterr()
-        rc = run_grant_command(audit_args)
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "grant_issued" in out
-        assert grant_id in out
-
-        # revoke removes it
-        revoke_args = _make_parser().parse_args(["grant", "revoke", grant_id])
-        capsys.readouterr()
-        rc = run_grant_command(revoke_args)
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert f"revoked={grant_id}" in out
-
-    def test_issue_rejects_root_device(self, capsys):
-        args = _make_parser().parse_args(
-            [
-                "grant", "issue",
-                "--operation", "CREATE_FILESYSTEM",
-                "--vm", "101",
-                "--hostname", "storage-guest",
-                "--device", "/dev/sda1",
-                "--fs", "ext4",
-                "--label", "X",
-                "--subject", "operator",
-                "--session", "sess-1",
-            ]
-        )
-        rc = run_grant_command(args)
         assert rc == 2
         err = capsys.readouterr().err
-        assert "root/whole-disk" in err
+        assert "REFUSED" in err
+        assert "running Hermes process" in err
+        # No grant was created by the CLI.
+        assert len(dg.list_grants()) == before
 
-    def test_issue_rejects_hostname_mismatch(self, capsys, monkeypatch):
-        monkeypatch.setattr(
-            "tools.qga_structured.qga_guest_identity",
-            lambda vm_id: {"hostname": "other-host", "boot_id": "boot-A",
-                           "product_uuid": "uuid-A"},
-        )
-        args = _make_parser().parse_args(
-            [
-                "grant", "issue",
-                "--operation", "CREATE_FILESYSTEM",
-                "--vm", "101",
-                "--hostname", "storage-guest",
-                "--device", "/dev/sdb1",
-                "--fs", "ext4",
-                "--label", "X",
-                "--subject", "operator",
-                "--session", "sess-1",
-            ]
-        )
-        rc = run_grant_command(args)
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "does not match" in err
-
-    def test_issue_refuses_unattended_without_transport(self, capsys, monkeypatch):
-        """No TTY and no approval transport -> no grant (B1)."""
-        from hermes_cli.subcommands import grant as grant_mod
-
-        monkeypatch.setattr(
-            "tools.approval._present_with_selected_transport", None
-        )
-        # Simulate a non-TTY stdin (no isatty, no readline).
-        class _NonTtyStdin:
-            def isatty(self):
-                return False
-
-        monkeypatch.setattr(grant_mod.sys, "stdin", _NonTtyStdin())
-        # Restore the REAL receipt gate for this test (the autouse fixture
-        # mocks it away for the other tests).
-        monkeypatch.setattr(
-            grant_mod, "_obtain_human_receipt", _REAL_OBTAIN_HUMAN_RECEIPT
-        )
-        args = _make_parser().parse_args(
-            [
-                "grant", "issue",
-                "--operation", "CREATE_FILESYSTEM",
-                "--vm", "101",
-                "--hostname", "storage-guest",
-                "--device", "/dev/sdb1",
-                "--fs", "ext4",
-                "--label", "X",
-                "--subject", "operator",
-                "--session", "sess-1",
-            ]
-        )
-        rc = run_grant_command(args)
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "refusing unattended issuance" in err
-
-    def test_issue_json_output(self, capsys):
+    def test_issue_json_also_refused(self, capsys):
         args = _make_parser().parse_args(
             [
                 "grant", "issue",
@@ -244,9 +114,38 @@ class TestGrantCommand:
             ]
         )
         rc = run_grant_command(args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "REFUSED" in err
+
+    def test_list_audit_revoke_workflow(self, capsys):
+        """list/audit/revoke remain operational (no issuance)."""
+        # list on an empty pool
+        list_args = _make_parser().parse_args(["grant", "list"])
+        rc = run_grant_command(list_args)
         assert rc == 0
         out = capsys.readouterr().out
-        data = json.loads(out)
-        assert data["authorization_source"] == "USER"
-        assert data["device"] == "/dev/sdb1"
-        assert data["operation"] == "CREATE_FILESYSTEM"
+        assert "No live grants" in out
+
+        # audit on an empty trail
+        audit_args = _make_parser().parse_args(["grant", "audit"])
+        rc = run_grant_command(audit_args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No audit entries" in out
+
+        # revoke of an unknown (but well-formed) id
+        revoke_args = _make_parser().parse_args(
+            ["grant", "revoke", "99999999-9999-4999-8999-999999999999"]
+        )
+        rc = run_grant_command(revoke_args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not_found" in err
+
+        # revoke of a malformed id -> clean error, no crash
+        revoke_args = _make_parser().parse_args(["grant", "revoke", "not-a-uuid"])
+        rc = run_grant_command(revoke_args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "invalid grant id" in err

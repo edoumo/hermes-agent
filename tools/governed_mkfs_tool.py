@@ -1,13 +1,16 @@
 """Governed mkfs tool — the only path that can create a filesystem.
 
 This tool is the structured alternative to the hardline-blocked ``mkfs`` in
-the generic terminal.  It implements the full mandate workflow:
+the generic terminal.  It implements the full mandate workflow IN THE
+CONSUMER PROCESS (review #100694 process-boundary blocker):
 
-    grant_id (opaque, issued by the user at a trusted boundary)
+    model requests (vm_id, device, fs_type, label) in a live session
+    -> capture trusted guest identity (product_uuid + boot_id + hostname)
+    -> request human approval for the EXACT observed tuple + incarnation
+    -> issue grant in THIS process (same ProcessEphemeralAuthority that
+       will claim and verify it)
     -> claim_grant (atomic reservation BEFORE any effect; one winner)
-    -> verify_grant (exact tuple: operation/vm/device/fs/label/session)
-    -> qga_guest_identity (durable generation fencing: boot_id + hostname
-       must match the incarnation captured at issue time)
+    -> re-read incarnation (sink fencing)
     -> qga_prechecks (all mandatory checks, fail-closed)
     -> TOCTOU recheck (identity unchanged since precheck, boot_id included)
     -> qga_create_filesystem (argv built from allowlisted fields only)
@@ -15,14 +18,19 @@ the generic terminal.  It implements the full mandate workflow:
     -> settle_grant (durable settlement: completed / failed_pre_effect /
        indeterminate; the grant NEVER returns to the pool once claimed)
 
+The model can REQUEST a destructive authorization; it can never grant it to
+itself.  The human approval, the receipt, the grant mint, the claim and the
+mutation all happen in the same long-lived Hermes process, so the authority
+generation of the issuer IS the authority generation of the consumer.
+
 Red lines enforced here:
 
 * The generic terminal policy is untouched: ``mkfs`` stays hardline.
 * No shell string is ever built from model input.
 * ``--yolo``, approvals.mode=off, allowlist, cron approve and ``force``
-  cannot authorize this path: the grant is the ONLY authority, and it is
-  verified against the exact tuple plus the live session id.
-* The model never sees grant internals — only the opaque ``grant_id``.
+  cannot authorize this path: the receipt gate refuses every bypass
+  context, and the grant is the ONLY authority.
+* The model never sees grant internals — only the outcome.
 * A mutation may have happened as soon as the execution step starts: any
   failure from that point on is settled ``indeterminate`` and reported as
   INDETERMINATE, never as a retryable DENY (review #100694 blocker 2;
@@ -43,9 +51,13 @@ from tools.destructive_grants import (
     GrantInFlightError,
     GrantNotFoundError,
     claim_grant,
-    load_grant,
+    issue_grant,
     settle_grant,
     verify_grant,
+)
+from tools.grant_authority import (
+    ReceiptError,
+    request_destructive_grant_approval,
 )
 from tools.qga_structured import (
     QgaError,
@@ -60,23 +72,20 @@ logger = logging.getLogger(__name__)
 GOVERNED_MKFS_SCHEMA = {
     "name": "governed_mkfs",
     "description": (
-        "Create a filesystem on an exact, pre-authorized target using a "
-        "one-shot capability grant issued by the user (hermes grant issue). "
+        "Create a filesystem on an exact, pre-authorized target. "
         "The generic terminal mkfs remains blocked; this is the ONLY governed "
-        "path. Requires: grant_id (opaque), vm_id, device (exact partition), "
-        "fs_type, label. All prechecks run fail-closed inside the guest; the "
-        "grant is consumed atomically after success and can never be replayed."
+        "path. Requires: vm_id, device (exact partition), fs_type, label. "
+        "The tool captures the live guest identity, asks the human for an "
+        "explicit one-shot approval of the exact target, and runs all "
+        "prechecks fail-closed inside the guest. The capability is consumed "
+        "atomically after success and can never be replayed."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "grant_id": {
-                "type": "string",
-                "description": "Opaque one-shot grant id issued by the user via `hermes grant issue`.",
-            },
             "vm_id": {
                 "type": "string",
-                "description": "Proxmox VM id, e.g. '148'.",
+                "description": "Proxmox VM id, e.g. '101'.",
             },
             "device": {
                 "type": "string",
@@ -92,7 +101,7 @@ GOVERNED_MKFS_SCHEMA = {
                 "description": "Filesystem label, 1-16 chars [A-Za-z0-9_.-].",
             },
         },
-        "required": ["grant_id", "vm_id", "device", "fs_type", "label"],
+        "required": ["vm_id", "device", "fs_type", "label"],
     },
 }
 
@@ -164,15 +173,12 @@ def _identity_snapshot(checks: Dict[str, object]) -> Dict[str, object]:
 
 
 def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
-    grant_id = args.get("grant_id")
     vm_id = args.get("vm_id")
     device = args.get("device")
     fs_type = args.get("fs_type")
     label = args.get("label")
     session_id = kwargs.get("session_id") or ""
 
-    if not isinstance(grant_id, str) or not grant_id:
-        return _deny("grant_id_required")
     if not isinstance(vm_id, str) or not vm_id:
         return _deny("vm_id_required")
     if not isinstance(device, str) or not device:
@@ -184,7 +190,85 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
     if not session_id:
         return _deny("session_id_required", reason_detail="governed_mkfs requires a live session context")
 
-    # 0. Atomic claim BEFORE any effect (review #100694 blocker 2).  The claim
+    # 0. Capture the trusted guest identity BEFORE any approval: the human
+    #    approves the EXACT observed incarnation (review #100694 blocker 3
+    #    + process-boundary blocker).  identity observed BEFORE approval ==
+    #    identity human approved == identity authenticated in the grant.
+    try:
+        identity = qga_guest_identity(vm_id)
+    except QgaError as exc:
+        return _deny("incarnation_unavailable", detail=str(exc))
+
+    if (
+        not identity.get("product_uuid")
+        or not identity.get("boot_id")
+        or not identity.get("hostname")
+    ):
+        return _deny(
+            "incarnation_incomplete",
+            detail="product_uuid/boot_id/hostname missing from guest identity",
+        )
+
+    # 1. Human approval for the EXACT observed tuple + incarnation.  The
+    #    receipt gate refuses yolo / mode=off / cron / unattended /
+    #    single-query; only an explicit human "approve once" produces a
+    #    receipt.  The model can request; it cannot grant.
+    try:
+        receipt = request_destructive_grant_approval(
+            operation="CREATE_FILESYSTEM",
+            vm_id=vm_id,
+            device=device,
+            fs_type=fs_type,
+            label=label,
+            session_id=session_id,
+            ttl_seconds=600,
+            incarnation_product_uuid=str(identity["product_uuid"]),
+            incarnation_boot_id=str(identity["boot_id"]),
+            incarnation_hostname=str(identity["hostname"]),
+        )
+    except ReceiptError as exc:
+        from tools.destructive_grants import _audit
+
+        _audit(
+            {
+                "event": "grant_denied",
+                "reason": "human_approval_denied",
+                "operation": "CREATE_FILESYSTEM",
+                "vm_id": vm_id,
+                "device": device,
+                "fs_type": fs_type,
+                "label": label,
+                "session_id": session_id,
+                "detail": str(exc),
+            }
+        )
+        return _deny("human_approval_denied", detail=str(exc))
+
+    # 2. Issue the grant IN THIS PROCESS: the same ProcessEphemeralAuthority
+    #    that will claim and verify it.  No CLI child, no cross-process
+    #    projection, no shared secret.
+    try:
+        grant = issue_grant(
+            operation="CREATE_FILESYSTEM",
+            vm_id=vm_id,
+            hostname=str(identity["hostname"]),
+            device=device,
+            fs_type=fs_type,
+            label=label,
+            authorization_subject="human-approval",
+            session_id=session_id,
+            receipt_id=receipt.receipt_id,
+            incarnation_product_uuid=str(identity["product_uuid"]),
+            incarnation_boot_id=str(identity["boot_id"]),
+            incarnation_hostname=str(identity["hostname"]),
+            ttl_seconds=600,
+        )
+    except GrantError as exc:
+        return _deny("grant_issue_failed", detail=str(exc))
+
+    grant_id = grant.grant_id
+
+    # 3. Atomic claim BEFORE any effect (review #100694 blocker 2).  The claim
     #    is a rename-based reservation: exactly one concurrent caller wins;
     #    the loser is denied before any QGA call.  The claim is bound to this
     #    execution id, which the settlement later re-checks.
@@ -202,7 +286,7 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
     except GrantError as exc:
         return _deny("grant_error", detail=str(exc))
 
-    # 1. Grant verification (exact tuple + expiry + integrity).  Any mismatch
+    # 4. Grant verification (exact tuple + expiry + integrity).  Any mismatch
     #    raises and is recorded in the audit trail.  A claimed grant is
     #    rejected here (no double-claim).
     try:
@@ -226,12 +310,12 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
         settle_grant(grant_id, execution_id, "failed_pre_effect")
         return _deny("grant_error", detail=str(exc), outcome="failed_pre_effect")
 
-    # 2. Durable generation fencing at the sink (review #100694 blocker 3;
+    # 5. Durable generation fencing at the sink (review #100694 blocker 3;
     #    #90145).  The incarnation captured at issue time must match the live
     #    guest right now.  A replaced/rebooted VM (ABA) is denied BEFORE any
     #    mutation.
     try:
-        identity = qga_guest_identity(vm_id)
+        identity_now = qga_guest_identity(vm_id)
     except QgaError as exc:
         settle_grant(grant_id, execution_id, "failed_pre_effect")
         return _deny(
@@ -239,23 +323,23 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
         )
 
     if (
-        identity.get("product_uuid") != grant.incarnation_product_uuid
-        or identity.get("boot_id") != grant.incarnation_boot_id
-        or identity.get("hostname") != grant.incarnation_hostname
+        identity_now.get("product_uuid") != grant.incarnation_product_uuid
+        or identity_now.get("boot_id") != grant.incarnation_boot_id
+        or identity_now.get("hostname") != grant.incarnation_hostname
     ):
         settle_grant(grant_id, execution_id, "failed_pre_effect")
         return _deny(
             "incarnation_changed",
             expected_product_uuid=grant.incarnation_product_uuid,
-            observed_product_uuid=identity.get("product_uuid"),
+            observed_product_uuid=identity_now.get("product_uuid"),
             expected_boot_id=grant.incarnation_boot_id,
-            observed_boot_id=identity.get("boot_id"),
+            observed_boot_id=identity_now.get("boot_id"),
             expected_hostname=grant.incarnation_hostname,
-            observed_hostname=identity.get("hostname"),
+            observed_hostname=identity_now.get("hostname"),
             outcome="failed_pre_effect",
         )
 
-    # 3. Mandatory prechecks inside the guest (fail-closed).
+    # 6. Mandatory prechecks inside the guest (fail-closed).
     try:
         prechecks = qga_prechecks(vm_id, device)
     except QgaError as exc:
@@ -271,7 +355,7 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
             "prechecks_failed", failures=failures, outcome="failed_pre_effect",
         )
 
-    # 4. TOCTOU recheck: identity must be unchanged since the precheck.
+    # 7. TOCTOU recheck: identity must be unchanged since the precheck.
     #    The precheck and the action run back-to-back over the same QGA
     #    channel; we re-read the critical identity fields immediately before
     #    executing and compare (boot_id included: a reboot between precheck
@@ -302,7 +386,7 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
             outcome="failed_pre_effect",
         )
 
-    # 5. Structured execution (argv built from allowlisted fields only).
+    # 8. Structured execution (argv built from allowlisted fields only).
     #    From this point on a mutation MAY have happened: any failure is
     #    settled as INDETERMINATE and the grant never returns to the pool.
     try:
@@ -325,7 +409,7 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
             decision="INDETERMINATE",
         )
 
-    # 6. Postcheck: filesystem type + label + uuid.
+    # 9. Postcheck: filesystem type + label + uuid.
     try:
         postcheck = qga_postcheck(vm_id, device, fs_type, label)
     except QgaError as exc:
@@ -354,14 +438,14 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
             decision="INDETERMINATE",
         )
 
-    # 7. Durable settlement: the grant is permanently out of the pool.  A
-    #    second use of the same grant is denied (replay protection).
+    # 10. Durable settlement: the grant is permanently out of the pool.  A
+    #     second use of the same grant is denied (replay protection).
     try:
         settle_grant(grant_id, execution_id, "completed")
     except GrantError as exc:
         return _deny(
             "settle_failed", detail=str(exc), outcome="indeterminate",
-            decision="INDETERMINATE",
+            decision="INDETERMINATE", grant_id=grant_id,
         )
 
     return _allow(

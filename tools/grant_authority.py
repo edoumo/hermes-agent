@@ -184,6 +184,9 @@ class HumanApprovalReceipt:
     device: str
     fs_type: str
     label: str
+    incarnation_product_uuid: str
+    incarnation_boot_id: str
+    incarnation_hostname: str
     issued_at: float
     expires_at: float
     human_decision: str = "approve_once"
@@ -201,6 +204,9 @@ class HumanApprovalReceipt:
             "device": self.device,
             "fs_type": self.fs_type,
             "label": self.label,
+            "incarnation_product_uuid": self.incarnation_product_uuid,
+            "incarnation_boot_id": self.incarnation_boot_id,
+            "incarnation_hostname": self.incarnation_hostname,
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
             "human_decision": self.human_decision,
@@ -265,24 +271,51 @@ def _build_request_text(
     label: str,
     session_id: str,
     ttl_seconds: int,
+    incarnation_product_uuid: str = "",
+    incarnation_boot_id: str = "",
+    incarnation_hostname: str = "",
 ) -> tuple:
-    """Return (command, description) shown to the human in the approval UI."""
+    """Return (command, description) shown to the human in the approval UI.
+
+    The observed guest incarnation is part of what the human approves: the
+    request text shows a readable identity so the human can confirm the
+    exact target generation before deciding.
+    """
     command = (
-        f"hermes grant issue --operation {operation} --vm {vm_id} "
-        f"--device {device} --fs {fs_type} --label {label} "
-        f"--session {session_id} --ttl {ttl_seconds}"
+        f"governed destructive operation: {operation} on VM {vm_id} "
+        f"device {device} as {fs_type} label {label} "
+        f"(session {session_id}, ttl {ttl_seconds}s)"
     )
     description = (
         f"One-shot destructive grant: {operation} on VM {vm_id} "
         f"device {device} as {fs_type} label {label}. "
+        f"Observed guest identity: hostname={incarnation_hostname or '?'} "
+        f"product_uuid={incarnation_product_uuid or '?'} "
+        f"boot_id={incarnation_boot_id or '?'}. "
         f"This capability is consumed by exactly one governed operation "
         f"and expires automatically."
     )
     return command, description
 
 
-def _request_digest(command: str, description: str, session_id: str) -> str:
-    canonical = "|".join([command, description, session_id])
+def _request_digest(
+    command: str,
+    description: str,
+    session_id: str,
+    incarnation_product_uuid: str = "",
+    incarnation_boot_id: str = "",
+    incarnation_hostname: str = "",
+) -> str:
+    canonical = "|".join(
+        [
+            command,
+            description,
+            session_id,
+            incarnation_product_uuid,
+            incarnation_boot_id,
+            incarnation_hostname,
+        ]
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -295,6 +328,9 @@ def request_destructive_grant_approval(
     label: str,
     session_id: str,
     ttl_seconds: int,
+    incarnation_product_uuid: str = "",
+    incarnation_boot_id: str = "",
+    incarnation_hostname: str = "",
     turn_id: str = "",
     tool_call_id: str = "",
 ) -> HumanApprovalReceipt:
@@ -358,8 +394,18 @@ def request_destructive_grant_approval(
         label=label,
         session_id=session_id,
         ttl_seconds=ttl_seconds,
+        incarnation_product_uuid=incarnation_product_uuid,
+        incarnation_boot_id=incarnation_boot_id,
+        incarnation_hostname=incarnation_hostname,
     )
-    digest = _request_digest(command, description, session_id)
+    digest = _request_digest(
+        command,
+        description,
+        session_id,
+        incarnation_product_uuid,
+        incarnation_boot_id,
+        incarnation_hostname,
+    )
     now = time.time()
     expires_at = now + ttl_seconds
 
@@ -407,6 +453,9 @@ def request_destructive_grant_approval(
                     device=device,
                     fs_type=fs_type,
                     label=label,
+                    incarnation_product_uuid=incarnation_product_uuid,
+                    incarnation_boot_id=incarnation_boot_id,
+                    incarnation_hostname=incarnation_hostname,
                     issued_at=now,
                     expires_at=expires_at,
                 )
@@ -455,6 +504,9 @@ def request_destructive_grant_approval(
                     device=device,
                     fs_type=fs_type,
                     label=label,
+                    incarnation_product_uuid=incarnation_product_uuid,
+                    incarnation_boot_id=incarnation_boot_id,
+                    incarnation_hostname=incarnation_hostname,
                     issued_at=now,
                     expires_at=expires_at,
                 )
@@ -489,6 +541,9 @@ def request_destructive_grant_approval(
                 device=device,
                 fs_type=fs_type,
                 label=label,
+                incarnation_product_uuid=incarnation_product_uuid,
+                incarnation_boot_id=incarnation_boot_id,
+                incarnation_hostname=incarnation_hostname,
                 issued_at=now,
                 expires_at=expires_at,
             )

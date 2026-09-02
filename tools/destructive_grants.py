@@ -519,6 +519,15 @@ def issue_grant(
             "receipt was approved for a different session "
             "(session-scoped authority denied)"
         )
+    if (
+        receipt.incarnation_product_uuid != incarnation_product_uuid
+        or receipt.incarnation_boot_id != incarnation_boot_id
+        or receipt.incarnation_hostname != incarnation_hostname
+    ):
+        raise GrantError(
+            "receipt was approved for a different guest incarnation "
+            "(identity observed before approval must equal the grant identity)"
+        )
     if receipt.expires_at < time.time():
         raise GrantError("receipt expired (human approval is no longer current)")
 

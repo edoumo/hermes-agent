@@ -1,11 +1,11 @@
-"""Adversarial Blocker 1 tests — Option A+ (review #100694, andrexibiza).
+"""Adversarial Blocker 1 tests — process-boundary contract (review #100694).
 
 Every attack below must fail mechanically:
 
     valid_grant=NO
     qga_create_filesystem_calls=0
 
-Attack matrix (mandate §14 Track J):
+Attack matrix (mandate §9 Track E):
 
 1.  direct issue_grant from execute_code (child process)
 2.  write arbitrary grant JSON (write_file surface)
@@ -18,7 +18,7 @@ Attack matrix (mandate §14 Track J):
 9.  replace receipt_id
 10. replay same human receipt
 11. issue second grant from same receipt
-12. terminal hermes grant issue (hardline)
+12. terminal hermes grant issue (hardline + CLI hard-fail)
 13. terminal pty=true (hardline)
 14. yolo
 15. approvals.mode=off
@@ -28,7 +28,18 @@ Attack matrix (mandate §14 Track J):
 19. child process provider
 20. restart provider generation
 
-Isolation proofs (Track G):
+Legitimate-flow witness (the ONLY issuer is the consumer process):
+
+    running Hermes process B
+    -> model requests governed operation
+    -> mocked REAL human approve_once
+    -> B observes incarnation
+    -> B issues grant with authority B
+    -> B claims grant
+    -> exactly one qga_create_filesystem call
+    -> completed
+
+Isolation proofs:
 
 - parent Hermes PID != execute_code kernel PID
 - execute_code cannot retrieve the parent's process authority secret
@@ -43,6 +54,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -53,6 +65,7 @@ from tools.governed_mkfs_tool import _handle_governed_mkfs
 from tests.tools.test_grant_authority_lifecycle import (
     _INCARNATION,
     _make_receipt,
+    _mock_approval,
     _mock_qga,
 )
 
@@ -67,10 +80,10 @@ def _issue(**kw):
     return _base_issue(**kw)
 
 
-def _call(grant_id, **kw):
+def _call(**kw):
     from tests.tools.test_grant_authority_lifecycle import _call as _base_call
 
-    return _base_call(grant_id, **kw)
+    return _base_call(**kw)
 
 
 def _grant_path(grant_id):
@@ -141,10 +154,12 @@ def test_child_process_cannot_issue_valid_grant():
         "r = _store_receipt(HumanApprovalReceipt("
         "receipt_id='rcpt-'+uuid.uuid4().hex, request_id='r'*32, "
         "request_digest='d'*64, session_id='sess-1', turn_id='t', "
-        "tool_call_id='tc', operation='CREATE_FILESYSTEM', vm_id='148', "
+        "tool_call_id='tc', operation='CREATE_FILESYSTEM', vm_id='101', "
         "device='/dev/sdb1', fs_type='ext4', label='X', "
+        "incarnation_product_uuid='uuid-A', incarnation_boot_id='boot-A', "
+        "incarnation_hostname='storage-guest', "
         "issued_at=time.time(), expires_at=time.time()+600)); "
-        "g = dg.issue_grant(operation='CREATE_FILESYSTEM', vm_id='148', "
+        "g = dg.issue_grant(operation='CREATE_FILESYSTEM', vm_id='101', "
         "hostname='storage-guest', device='/dev/sdb1', fs_type='ext4', label='X', "
         "authorization_subject='operator', session_id='sess-1', "
         "receipt_id=r.receipt_id, incarnation_product_uuid='uuid-A', "
@@ -360,7 +375,7 @@ def test_secret_not_in_subprocess_environment():
 
 
 # ---------------------------------------------------------------------------
-# G5 — restart semantics (Track H)
+# G5 — restart semantics
 # ---------------------------------------------------------------------------
 
 
@@ -374,13 +389,12 @@ def test_restart_invalidates_live_grants():
 
 
 def test_restart_denies_consumption():
+    """A grant minted before a restart cannot be claimed/consumed after it:
+    the authority generation check rejects it before any effect."""
     grant = _issue()
     ga.reset_authority_for_tests()
-    exec_calls = []
-    with _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
-        result = _call(grant.grant_id)
-    assert result["decision"] == "DENY"
-    assert exec_calls == []
+    with pytest.raises(dg.GrantDeniedError):
+        dg.claim_grant(grant.grant_id, "exec-after-restart")
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +406,7 @@ def test_terminal_grant_issue_hardline_blocked():
     from tools.approval import detect_hardline_command
 
     for cmd in (
-        "hermes grant issue --operation CREATE_FILESYSTEM --vm 148 --device /dev/sdb1 --fs ext4 --label X --session s1",
+        "hermes grant issue --operation CREATE_FILESYSTEM --vm 101 --device /dev/sdb1 --fs ext4 --label X --session s1",
         "sudo hermes grant issue --vm 1",
         "echo hi; hermes grant issue --vm 1",
         "hermes grant issue --vm 1 --json",
@@ -406,7 +420,7 @@ def test_terminal_pty_grant_issue_hardline_blocked():
 
     # pty=true does not change the command string: still hardline-blocked.
     is_hl, _ = detect_hardline_command(
-        "hermes grant issue --operation CREATE_FILESYSTEM --vm 148 --device /dev/sdb1 --fs ext4 --label X --session s1"
+        "hermes grant issue --operation CREATE_FILESYSTEM --vm 101 --device /dev/sdb1 --fs ext4 --label X --session s1"
     )
     assert is_hl
 
@@ -419,7 +433,7 @@ def test_yolo_cannot_bypass_grant_issue_hardline(monkeypatch):
     )
 
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
-    cmd = "hermes grant issue --operation CREATE_FILESYSTEM --vm 148 --device /dev/sdb1 --fs ext4 --label X --session s1"
+    cmd = "hermes grant issue --operation CREATE_FILESYSTEM --vm 101 --device /dev/sdb1 --fs ext4 --label X --session s1"
     assert detect_hardline_command(cmd)[0] is True
     r1 = check_dangerous_command(cmd, "local")
     assert r1["approved"] is False and r1.get("hardline") is True
@@ -432,7 +446,7 @@ def test_approvals_mode_off_cannot_bypass_grant_issue_hardline(monkeypatch):
     from tools.approval import check_all_command_guards
 
     monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "off")
-    cmd = "hermes grant issue --operation CREATE_FILESYSTEM --vm 148 --device /dev/sdb1 --fs ext4 --label X --session s1"
+    cmd = "hermes grant issue --operation CREATE_FILESYSTEM --vm 101 --device /dev/sdb1 --fs ext4 --label X --session s1"
     r = check_all_command_guards(cmd, "local")
     assert r["approved"] is False and r.get("hardline") is True
 
@@ -443,7 +457,7 @@ def test_cron_approve_cannot_bypass_grant_issue_hardline(monkeypatch):
 
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
     monkeypatch.setattr(approval_mod, "_get_cron_approval_mode", lambda: "approve")
-    cmd = "hermes grant issue --operation CREATE_FILESYSTEM --vm 148 --device /dev/sdb1 --fs ext4 --label X --session s1"
+    cmd = "hermes grant issue --operation CREATE_FILESYSTEM --vm 101 --device /dev/sdb1 --fs ext4 --label X --session s1"
     r = check_all_command_guards(cmd, "local")
     assert r["approved"] is False and r.get("hardline") is True
 
@@ -533,13 +547,89 @@ def test_approval_gate_refuses_no_human_surface(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# E — legitimate-flow witness (the ONLY issuer is the consumer process)
+# ---------------------------------------------------------------------------
+
+
+def test_legitimate_flow_in_process_witness():
+    """The documented production flow: the running Hermes process observes
+    the incarnation, the human approves once, the SAME process mints the
+    grant with its own authority, claims it, and executes exactly one
+    qga_create_filesystem call -> completed."""
+    exec_calls = []
+    with _mock_approval(), _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
+        result = _call()
+    assert result["decision"] == "ALLOW"
+    assert result["outcome"] == "completed"
+    assert len(exec_calls) == 1
+    # The grant was minted by THIS process: its generation is the consumer
+    # generation (the handler's issue_grant used get_authority()).
+    assert result["grant_id"]
+    grant = dg._grant_path(result["grant_id"])
+    assert not grant.exists()  # settled: removed from the pool
+
+
+def test_human_denial_no_grant_no_qga():
+    """human decision = deny => grant_created=NO, qga_calls=0."""
+    exec_calls = []
+    with _mock_approval(decision="deny"), _mock_qga(
+        exec_side_effect=lambda: exec_calls.append(1)
+    ):
+        result = _call()
+    assert result["decision"] == "DENY"
+    assert result["reason"] == "human_approval_denied"
+    assert exec_calls == []
+    assert dg.list_grants() == []
+
+
+def test_approval_unavailable_no_grant_no_qga():
+    """Approval transport lost / no human surface => grant_created=NO,
+    qga_calls=0."""
+    import tools.approval as approval_mod
+    from tools.grant_authority import ReceiptError
+
+    def _no_surface(**kwargs):
+        raise ReceiptError("no human surface available")
+
+    exec_calls = []
+    with patch("tools.governed_mkfs_tool.request_destructive_grant_approval",
+               side_effect=_no_surface), _mock_qga(
+        exec_side_effect=lambda: exec_calls.append(1)
+    ):
+        result = _call()
+    assert result["decision"] == "DENY"
+    assert result["reason"] == "human_approval_denied"
+    assert exec_calls == []
+    assert dg.list_grants() == []
+
+
+def test_incarnation_replacement_between_approval_and_effect():
+    """observe A -> human approves A -> live target becomes B -> sink
+    re-read = B => DENY, qga_calls=0."""
+    exec_calls = []
+    with _mock_approval(), _mock_qga(
+        identity={"hostname": "storage-guest", "boot_id": "boot-A",
+                  "product_uuid": "uuid-A"},
+        identity_after={"hostname": "storage-guest", "boot_id": "boot-B",
+                        "product_uuid": "uuid-A"},
+        exec_side_effect=lambda: exec_calls.append(1),
+    ):
+        result = _call()
+    assert result["decision"] == "DENY"
+    assert result["reason"] == "incarnation_changed"
+    assert exec_calls == []
+
+
+# ---------------------------------------------------------------------------
 # J — end-to-end: forged grant never reaches qga_create_filesystem
 # ---------------------------------------------------------------------------
 
 
 def test_forged_grant_never_reaches_qga():
     """A forged grant file is denied at load; qga_create_filesystem is never
-    called."""
+    called.  The governed handler no longer accepts an external grant_id at
+    all: the schema has no grant_id parameter, so a forged grant cannot even
+    be referenced by the model-facing tool."""
     forged_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     forged = {
         "grant_id": forged_id,
@@ -565,16 +655,20 @@ def test_forged_grant_never_reaches_qga():
         "incarnation_hostname": "storage-guest",
     }
     _write_grant(forged_id, forged)
-    exec_calls = []
-    with _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
-        result = _call(forged_id)
-    assert result["decision"] == "DENY"
-    assert exec_calls == []
+    # The forged file is rejected by the integrity check.
+    with pytest.raises(dg.GrantDeniedError):
+        dg.load_grant(forged_id)
+    # The model-facing schema has no grant_id: the handler cannot be pointed
+    # at the forged file at all.
+    from tools.governed_mkfs_tool import GOVERNED_MKFS_SCHEMA
+
+    assert "grant_id" not in GOVERNED_MKFS_SCHEMA["parameters"]["properties"]
+    assert "grant_id" not in GOVERNED_MKFS_SCHEMA["parameters"]["required"]
 
 
 def test_child_minted_grant_never_reaches_qga():
     """A grant minted by a child process is rejected by the parent's
-    governed path; qga_create_filesystem is never called."""
+    authority; the governed path never consumes it."""
     code = (
         "import sys, time, uuid; sys.path.insert(0, %r); "
         "from tools import destructive_grants as dg; "
@@ -582,10 +676,12 @@ def test_child_minted_grant_never_reaches_qga():
         "r = _store_receipt(HumanApprovalReceipt("
         "receipt_id='rcpt-'+uuid.uuid4().hex, request_id='r'*32, "
         "request_digest='d'*64, session_id='sess-1', turn_id='t', "
-        "tool_call_id='tc', operation='CREATE_FILESYSTEM', vm_id='148', "
+        "tool_call_id='tc', operation='CREATE_FILESYSTEM', vm_id='101', "
         "device='/dev/sdb1', fs_type='ext4', label='X', "
+        "incarnation_product_uuid='uuid-A', incarnation_boot_id='boot-A', "
+        "incarnation_hostname='storage-guest', "
         "issued_at=time.time(), expires_at=time.time()+600)); "
-        "g = dg.issue_grant(operation='CREATE_FILESYSTEM', vm_id='148', "
+        "g = dg.issue_grant(operation='CREATE_FILESYSTEM', vm_id='101', "
         "hostname='storage-guest', device='/dev/sdb1', fs_type='ext4', label='X', "
         "authorization_subject='operator', session_id='sess-1', "
         "receipt_id=r.receipt_id, incarnation_product_uuid='uuid-A', "
@@ -598,8 +694,6 @@ def test_child_minted_grant_never_reaches_qga():
     )
     assert out.returncode == 0, out.stderr
     child_grant_id = out.stdout.strip()
-    exec_calls = []
-    with _mock_qga(exec_side_effect=lambda: exec_calls.append(1)):
-        result = _call(child_grant_id)
-    assert result["decision"] == "DENY"
-    assert exec_calls == []
+    # The parent rejects the child-minted grant before any effect.
+    with pytest.raises(dg.GrantDeniedError):
+        dg.load_grant(child_grant_id)

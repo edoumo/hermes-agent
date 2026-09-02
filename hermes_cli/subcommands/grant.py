@@ -1,21 +1,18 @@
 """``hermes grant`` — manage explicitly approved one-shot destructive grants.
 
-Issuance requires both:
+Issuance is NOT available from this CLI.  A destructive grant is minted
+exclusively inside the long-lived Hermes process that will consume it: the
+model requests the governed operation, the process captures the live guest
+incarnation, asks the human for an explicit ``approve once`` decision
+through the approval surface, and issues the grant with its own
+process-local authority.  A short-lived CLI process cannot sign a grant the
+running Hermes process would accept (different authority generation), so
+``hermes grant issue`` refuses explicitly and points to the governed tool.
 
-* a live, read-only capture of the target guest incarnation (hostname,
-  ``boot_id`` and ``product_uuid``) through the structured QGA adapter; and
-* a correlated, one-shot human approval receipt produced by the existing
-  approval layer after an explicit ``approve once`` decision.
-
-The CLI itself is not the authority proof. The receipt and the authenticated
-process-bound grant are the security boundary; unattended/bypass contexts are
-refused by ``tools.grant_authority``.
+``hermes grant list`` / ``revoke`` / ``audit`` remain available for
+operational visibility.
 
 Example::
-
-    hermes grant issue --operation CREATE_FILESYSTEM --vm 101 \
-        --hostname storage-guest --device /dev/sdb1 --fs ext4 \
-        --label DATA --subject operator --session <session-id> [--ttl 600]
 
     hermes grant list
     hermes grant revoke <grant_id>
@@ -32,70 +29,40 @@ from typing import Dict
 from tools.destructive_grants import GrantError
 
 
-def _obtain_human_receipt(args) -> Dict[str, object]:
-    """Obtain a correlated, one-shot human approval receipt.
-
-    The approval layer routes through a real human surface (configured
-    transport, gateway round-trip, or standard interactive CLI prompt) and
-    refuses yolo, mode-off, cron, unattended and single-query bypass contexts.
-    The caller never supplies a free-form evidence object.
-    """
-    from tools.grant_authority import ReceiptError, request_destructive_grant_approval
-
-    try:
-        receipt = request_destructive_grant_approval(
-            operation=args.operation,
-            vm_id=args.vm_id,
-            device=args.device,
-            fs_type=args.fs_type,
-            label=args.label,
-            session_id=args.session_id,
-            ttl_seconds=args.ttl,
-        )
-    except ReceiptError as exc:
-        raise GrantError(str(exc)) from exc
-    return receipt.to_dict()
-
-
 def build_grant_parser(subparsers, *, cmd_grant=None) -> None:
     parser = subparsers.add_parser(
         "grant",
-        help="Issue and manage explicitly approved one-shot destructive grants.",
+        help="Manage explicitly approved one-shot destructive grants.",
     )
     grant_sub = parser.add_subparsers(dest="grant_command")
 
     issue = grant_sub.add_parser(
         "issue",
-        help="Issue a one-shot grant for an exact destructive operation.",
+        help="REFUSED: destructive grants are minted by the running Hermes process, not the CLI.",
     )
     issue.add_argument(
         "--operation",
-        required=True,
         help="Operation, e.g. CREATE_FILESYSTEM.",
     )
-    issue.add_argument("--vm", dest="vm_id", required=True, help="Target VM id.")
-    issue.add_argument("--hostname", required=True, help="Expected guest hostname.")
+    issue.add_argument("--vm", dest="vm_id", help="Target VM id.")
+    issue.add_argument("--hostname", help="Expected guest hostname.")
     issue.add_argument(
         "--device",
-        required=True,
         help="Exact validated block-device path, e.g. /dev/sdb1.",
     )
     issue.add_argument(
         "--fs",
         dest="fs_type",
-        required=True,
         help="Filesystem type (ext4|xfs).",
     )
-    issue.add_argument("--label", required=True, help="Filesystem label (1-16 chars).")
+    issue.add_argument("--label", help="Filesystem label (1-16 chars).")
     issue.add_argument(
         "--subject",
-        required=True,
         help="Human-readable audit subject (not an authority credential).",
     )
     issue.add_argument(
         "--session",
         dest="session_id",
-        required=True,
         help="Hermes session id bound to the approval and grant.",
     )
     issue.add_argument(
@@ -121,7 +88,6 @@ def build_grant_parser(subparsers, *, cmd_grant=None) -> None:
 
 def run_grant_command(args) -> int:
     from tools.destructive_grants import (
-        issue_grant,
         list_grants,
         read_audit_trail,
         revoke_grant,
@@ -130,73 +96,21 @@ def run_grant_command(args) -> int:
     cmd = getattr(args, "grant_command", None)
 
     if cmd == "issue":
-        try:
-            from tools.qga_structured import QgaError, qga_guest_identity
-
-            try:
-                identity = qga_guest_identity(args.vm_id)
-            except QgaError as exc:
-                print(f"ERROR: cannot capture VM incarnation (QGA): {exc}", file=sys.stderr)
-                return 2
-
-            if (
-                not identity.get("product_uuid")
-                or not identity.get("boot_id")
-                or not identity.get("hostname")
-            ):
-                print(
-                    "ERROR: VM incarnation incomplete "
-                    "(product_uuid/boot_id/hostname missing)",
-                    file=sys.stderr,
-                )
-                return 2
-            if identity.get("hostname") != args.hostname:
-                print(
-                    f"ERROR: live guest hostname {identity.get('hostname')!r} "
-                    f"does not match --hostname {args.hostname!r}",
-                    file=sys.stderr,
-                )
-                return 2
-
-            receipt = _obtain_human_receipt(args)
-
-            grant = issue_grant(
-                operation=args.operation,
-                vm_id=args.vm_id,
-                hostname=args.hostname,
-                device=args.device,
-                fs_type=args.fs_type,
-                label=args.label,
-                authorization_subject=args.subject,
-                session_id=args.session_id,
-                receipt_id=str(receipt["receipt_id"]),
-                incarnation_product_uuid=str(identity["product_uuid"]),
-                incarnation_boot_id=str(identity["boot_id"]),
-                incarnation_hostname=str(identity["hostname"]),
-                ttl_seconds=args.ttl,
-            )
-        except GrantError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 2
-
-        if getattr(args, "json", False):
-            print(json.dumps(grant.to_dict(), sort_keys=True, ensure_ascii=False))
-        else:
-            print(f"grant_id={grant.grant_id}")
-            print(f"operation={grant.operation}")
-            print(f"vm_id={grant.vm_id}")
-            print(f"hostname={grant.hostname}")
-            print(f"device={grant.device}")
-            print(f"fs_type={grant.fs_type}")
-            print(f"label={grant.label}")
-            print(f"authorization_subject={grant.authorization_subject}")
-            print(f"authorization_source={grant.authorization_source}")
-            print(f"session_id={grant.session_id}")
-            print(f"incarnation_product_uuid={grant.incarnation_product_uuid}")
-            print(f"incarnation_boot_id={grant.incarnation_boot_id}")
-            print(f"expires_at={grant.expires_at}")
-            print("NOTE: the grant is one-shot and expires automatically.")
-        return 0
+        # Track A (review #100694 process-boundary blocker): a short-lived
+        # CLI process must NOT mint a grant the running Hermes process would
+        # consume — the authority generations differ, so the grant would be
+        # rejected at claim time anyway.  Issuance happens exclusively inside
+        # the long-lived Hermes process via the governed tool, which asks
+        # the human through the approval surface.
+        print(
+            "REFUSED: destructive grants are minted by the running Hermes "
+            "process, not by this CLI. Request the governed operation "
+            "(e.g. governed_mkfs) in a live Hermes session; the process will "
+            "ask the human for an explicit one-shot approval of the exact "
+            "target and issue the grant in-process.",
+            file=sys.stderr,
+        )
+        return 2
 
     if cmd == "list":
         grants = list_grants()
@@ -224,7 +138,7 @@ def run_grant_command(args) -> int:
     if cmd == "revoke":
         try:
             ok = revoke_grant(args.grant_id)
-        except OSError as exc:
+        except (OSError, GrantError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         if ok:

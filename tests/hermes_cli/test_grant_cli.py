@@ -5,7 +5,36 @@ import json
 
 import pytest
 
-from hermes_cli.subcommands.grant import build_grant_parser, run_grant_command
+from hermes_cli.subcommands.grant import (
+    _obtain_human_evidence as _REAL_OBTAIN_HUMAN_EVIDENCE,
+    build_grant_parser,
+    run_grant_command,
+)
+
+_EVIDENCE = {
+    "request_id": "req-11111111111111111111111111111111",
+    "request_digest": "d" * 64,
+    "decision": "once",
+    "principal": "Ed",
+    "surface": "cli",
+}
+
+_IDENTITY = {"hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A"}
+
+
+@pytest.fixture(autouse=True)
+def _mock_issue_boundaries(monkeypatch):
+    """The issue path now requires a live QGA incarnation capture and a
+    correlated human approval decision; both are mocked in CLI tests."""
+    from hermes_cli.subcommands import grant as grant_mod
+
+    monkeypatch.setattr(
+        "tools.qga_structured.qga_guest_identity",
+        lambda vm_id: dict(_IDENTITY),
+    )
+    monkeypatch.setattr(
+        grant_mod, "_obtain_human_evidence", lambda args: dict(_EVIDENCE)
+    )
 
 
 def _make_parser():
@@ -121,6 +150,66 @@ class TestGrantCommand:
         assert rc == 2
         err = capsys.readouterr().err
         assert "root/whole-disk" in err
+
+    def test_issue_rejects_hostname_mismatch(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "tools.qga_structured.qga_guest_identity",
+            lambda vm_id: {"hostname": "other-host", "boot_id": "boot-A",
+                           "product_uuid": "uuid-A"},
+        )
+        args = _make_parser().parse_args(
+            [
+                "grant", "issue",
+                "--operation", "CREATE_FILESYSTEM",
+                "--vm", "148",
+                "--hostname", "hp-mail",
+                "--device", "/dev/sdb1",
+                "--fs", "ext4",
+                "--label", "X",
+                "--subject", "Ed",
+                "--session", "sess-1",
+            ]
+        )
+        rc = run_grant_command(args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "does not match" in err
+
+    def test_issue_refuses_unattended_without_transport(self, capsys, monkeypatch):
+        """No TTY and no approval transport -> no grant (B1)."""
+        from hermes_cli.subcommands import grant as grant_mod
+
+        monkeypatch.setattr(
+            "tools.approval._present_with_selected_transport", None
+        )
+        # Simulate a non-TTY stdin (no isatty, no readline).
+        class _NonTtyStdin:
+            def isatty(self):
+                return False
+
+        monkeypatch.setattr(grant_mod.sys, "stdin", _NonTtyStdin())
+        # Restore the REAL evidence gate for this test (the autouse fixture
+        # mocks it away for the other tests).
+        monkeypatch.setattr(
+            grant_mod, "_obtain_human_evidence", _REAL_OBTAIN_HUMAN_EVIDENCE
+        )
+        args = _make_parser().parse_args(
+            [
+                "grant", "issue",
+                "--operation", "CREATE_FILESYSTEM",
+                "--vm", "148",
+                "--hostname", "hp-mail",
+                "--device", "/dev/sdb1",
+                "--fs", "ext4",
+                "--label", "X",
+                "--subject", "Ed",
+                "--session", "sess-1",
+            ]
+        )
+        rc = run_grant_command(args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "interactive terminal" in err
 
     def test_issue_json_output(self, capsys):
         args = _make_parser().parse_args(

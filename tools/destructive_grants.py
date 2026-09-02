@@ -100,6 +100,17 @@ class GrantConsumedError(GrantDeniedError):
     pass
 
 
+class GrantInFlightError(GrantDeniedError):
+    """Raised when a grant is claimed by another execution (concurrent use)."""
+
+
+# Outcomes a grant can be settled with.  ``completed`` is the only success;
+# ``failed_pre_effect`` means no mutation can have happened; ``indeterminate``
+# means a mutation may have happened and the grant must NEVER return to the
+# pool (no blind retry, per #90144/#90145 and the review of #100694).
+VALID_SETTLEMENT_OUTCOMES = ("completed", "failed_pre_effect", "indeterminate")
+
+
 @dataclass(frozen=True)
 class DestructiveGrant:
     """Immutable one-shot capability record."""
@@ -118,8 +129,16 @@ class DestructiveGrant:
     expires_at: float
     nonce: str
     binding_sha256: str
+    authorization_evidence: Dict[str, object]
+    incarnation_product_uuid: str
+    incarnation_boot_id: str
+    incarnation_hostname: str
     consumed: bool = False
     consumed_at: Optional[float] = None
+    claimed_by_execution: Optional[str] = None
+    claimed_at: Optional[float] = None
+    settlement_outcome: Optional[str] = None
+    settled_at: Optional[float] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -137,13 +156,23 @@ class DestructiveGrant:
             "expires_at": self.expires_at,
             "nonce": self.nonce,
             "binding_sha256": self.binding_sha256,
+            "authorization_evidence": self.authorization_evidence,
+            "incarnation_product_uuid": self.incarnation_product_uuid,
+            "incarnation_boot_id": self.incarnation_boot_id,
+            "incarnation_hostname": self.incarnation_hostname,
             "consumed": self.consumed,
             "consumed_at": self.consumed_at,
+            "claimed_by_execution": self.claimed_by_execution,
+            "claimed_at": self.claimed_at,
+            "settlement_outcome": self.settlement_outcome,
+            "settled_at": self.settled_at,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "DestructiveGrant":
         consumed_at_raw = data.get("consumed_at")
+        claimed_at_raw = data.get("claimed_at")
+        settled_at_raw = data.get("settled_at")
         return cls(
             grant_id=str(data["grant_id"]),
             operation=str(data["operation"]),
@@ -159,9 +188,29 @@ class DestructiveGrant:
             expires_at=float(str(data["expires_at"])),
             nonce=str(data["nonce"]),
             binding_sha256=str(data["binding_sha256"]),
+            authorization_evidence=dict(data.get("authorization_evidence") or {}),
+            incarnation_product_uuid=str(data.get("incarnation_product_uuid") or ""),
+            incarnation_boot_id=str(data.get("incarnation_boot_id") or ""),
+            incarnation_hostname=str(data.get("incarnation_hostname") or ""),
             consumed=bool(data.get("consumed", False)),
             consumed_at=(
                 float(str(consumed_at_raw)) if consumed_at_raw is not None else None
+            ),
+            claimed_by_execution=(
+                str(data["claimed_by_execution"])
+                if data.get("claimed_by_execution") is not None
+                else None
+            ),
+            claimed_at=(
+                float(str(claimed_at_raw)) if claimed_at_raw is not None else None
+            ),
+            settlement_outcome=(
+                str(data["settlement_outcome"])
+                if data.get("settlement_outcome") is not None
+                else None
+            ),
+            settled_at=(
+                float(str(settled_at_raw)) if settled_at_raw is not None else None
             ),
         )
 
@@ -242,6 +291,7 @@ def validate_operation(operation: str) -> None:
 
 
 def _binding_sha256(
+    grant_id: str,
     operation: str,
     vm_id: str,
     hostname: str,
@@ -251,9 +301,26 @@ def _binding_sha256(
     subject: str,
     session_id: str,
     nonce: str,
+    issued_at: float,
+    expires_at: float,
+    evidence: Dict[str, object],
+    incarnation_product_uuid: str,
+    incarnation_boot_id: str,
+    incarnation_hostname: str,
 ) -> str:
+    """Canonical binding over the FULL grant identity.
+
+    Covers the grant id itself (a clone under a second UUID breaks the
+    hash even when the embedded id is rewritten), the operation tuple, the
+    human authorization evidence, the VM incarnation (durable generation:
+    product_uuid + boot_id + hostname), and the exact validity window
+    (``issued_at``/``expires_at``).  Any tamper — clone, TTL extension,
+    evidence swap, incarnation swap — breaks the recomputed hash and is
+    treated as DENY (review #100694 blocker 1; #90144/#90145).
+    """
     canonical = "|".join(
         [
+            grant_id,
             operation,
             vm_id,
             hostname,
@@ -263,6 +330,12 @@ def _binding_sha256(
             subject,
             session_id,
             nonce,
+            repr(issued_at),
+            repr(expires_at),
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+            incarnation_product_uuid,
+            incarnation_boot_id,
+            incarnation_hostname,
         ]
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -316,6 +389,10 @@ def issue_grant(
     label: str,
     authorization_subject: str,
     session_id: str,
+    authorization_evidence: Dict[str, object],
+    incarnation_product_uuid: str,
+    incarnation_boot_id: str,
+    incarnation_hostname: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> DestructiveGrant:
     """Create a one-shot grant.  ONLY callable from a trusted user boundary.
@@ -323,6 +400,13 @@ def issue_grant(
     This function is deliberately not reachable from any model tool: it lives
     in a module that no tool handler imports, and the CLI subcommand that
     wraps it runs in the user's own shell.
+
+    ``authorization_evidence`` is the correlated human approval decision
+    (request_id + request_digest + decision + principal + surface) produced
+    by the host approval transport; ``incarnation_product_uuid`` /
+    ``incarnation_boot_id`` / ``incarnation_hostname`` are the durable VM
+    generation captured at issue time (review #100694 blocker 1 + blocker 3;
+    #90144/#90145).
     """
     validate_operation(operation)
     validate_vm_id(vm_id)
@@ -338,13 +422,36 @@ def issue_grant(
         raise GrantError("ttl_seconds must be a positive integer")
     ttl_seconds = min(ttl_seconds, MAX_TTL_SECONDS)
 
+    # B1: a grant is only minted from a correlated, one-shot human decision.
+    if not isinstance(authorization_evidence, dict) or not authorization_evidence:
+        raise GrantError("authorization_evidence is required (correlated human decision)")
+    for key in ("request_id", "request_digest", "decision", "principal", "surface"):
+        if not authorization_evidence.get(key):
+            raise GrantError(f"authorization_evidence.{key} is required")
+    if authorization_evidence.get("decision") != "once":
+        raise GrantError(
+            "authorization_evidence.decision must be 'once' "
+            "(a one-shot grant cannot be minted from a session/permanent approval)"
+        )
+
+    # B3: the durable VM incarnation must be captured at issue time.
+    if not isinstance(incarnation_product_uuid, str) or not incarnation_product_uuid:
+        raise GrantError("incarnation_product_uuid is required (stable guest identity)")
+    if not isinstance(incarnation_boot_id, str) or not incarnation_boot_id:
+        raise GrantError("incarnation_boot_id is required (durable VM generation)")
+    if not isinstance(incarnation_hostname, str) or not incarnation_hostname:
+        raise GrantError("incarnation_hostname is required")
+
     _ensure_dir()
     now = time.time()
     nonce = secrets.token_hex(16)
     grant_id = str(uuid.uuid4())
     binding = _binding_sha256(
-        operation, vm_id, hostname, device, fs_type, label,
+        grant_id, operation, vm_id, hostname, device, fs_type, label,
         authorization_subject, session_id, nonce,
+        now, now + ttl_seconds,
+        authorization_evidence, incarnation_product_uuid,
+        incarnation_boot_id, incarnation_hostname,
     )
     grant = DestructiveGrant(
         grant_id=grant_id,
@@ -361,6 +468,10 @@ def issue_grant(
         expires_at=now + ttl_seconds,
         nonce=nonce,
         binding_sha256=binding,
+        authorization_evidence=dict(authorization_evidence),
+        incarnation_product_uuid=incarnation_product_uuid,
+        incarnation_boot_id=incarnation_boot_id,
+        incarnation_hostname=incarnation_hostname,
     )
 
     path = _grant_path(grant_id)
@@ -389,6 +500,10 @@ def issue_grant(
             "ttl_seconds": ttl_seconds,
             "expires_at": grant.expires_at,
             "binding_sha256": binding,
+            "incarnation_product_uuid": incarnation_product_uuid,
+            "incarnation_boot_id": incarnation_boot_id,
+            "evidence_request_id": authorization_evidence.get("request_id"),
+            "evidence_decision": authorization_evidence.get("decision"),
         }
     )
     logger.info("destructive grant %s issued for %s %s", grant_id, operation, device)
@@ -404,28 +519,46 @@ def load_grant(grant_id: str) -> DestructiveGrant:
     """Load a grant by opaque id.
 
     Raises GrantNotFoundError if absent, GrantConsumedError if the grant was
-    already consumed (replay), and GrantDeniedError if the file was tampered.
+    already consumed (replay), GrantInFlightError if the grant is claimed by
+    another execution, and GrantDeniedError if the file was tampered.
     """
     path = _grant_path(grant_id)
     if not path.exists():
-        # A consumed grant lives under the .consumed suffix: distinguish
-        # "never existed" from "already used" so callers can report replay.
-        consumed_path = path.with_suffix(".json.consumed")
-        if consumed_path.exists():
-            raise GrantConsumedError(f"grant {grant_id!r} already consumed (replay denied)")
-        raise GrantNotFoundError(f"grant {grant_id!r} not found")
+        # A claimed grant lives under the .claimed suffix (in-flight for the
+        # claiming execution); a consumed/settled grant is replay.
+        claimed_path = path.with_suffix(".json.claimed")
+        if claimed_path.exists():
+            path = claimed_path
+        else:
+            consumed_path = path.with_suffix(".json.consumed")
+            if consumed_path.exists():
+                raise GrantConsumedError(f"grant {grant_id!r} already consumed (replay denied)")
+            settled_path = path.with_suffix(".json.settled")
+            if settled_path.exists():
+                raise GrantConsumedError(f"grant {grant_id!r} already settled (replay denied)")
+            raise GrantNotFoundError(f"grant {grant_id!r} not found")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise GrantError(f"grant {grant_id!r} unreadable: {exc}") from exc
     grant = DestructiveGrant.from_dict(data)
+    # B1: the payload must be bound to the path id.  A clone under a second
+    # UUID (with or without rewriting the embedded id) is structurally denied.
+    if grant.grant_id != grant_id:
+        raise GrantDeniedError(
+            f"grant {grant_id!r} payload id mismatch (clone denied)"
+        )
     # Integrity: the stored binding must match the stored fields.  A tampered
-    # file (any field edited) fails here and is treated as DENY.
+    # file (any field edited, TTL extended, evidence or incarnation swapped)
+    # fails here and is treated as DENY.
     recomputed = _binding_sha256(
-        grant.operation, grant.vm_id, grant.hostname, grant.device,
-        grant.fs_type, grant.label, grant.authorization_subject,
+        grant.grant_id, grant.operation, grant.vm_id, grant.hostname,
+        grant.device, grant.fs_type, grant.label, grant.authorization_subject,
         grant.session_id, grant.nonce,
+        grant.issued_at, grant.expires_at,
+        grant.authorization_evidence, grant.incarnation_product_uuid,
+        grant.incarnation_boot_id, grant.incarnation_hostname,
     )
     if recomputed != grant.binding_sha256:
         raise GrantDeniedError(f"grant {grant_id!r} integrity check failed (tampered)")
@@ -441,11 +574,15 @@ def verify_grant(
     fs_type: str,
     label: str,
     session_id: str,
+    claimed_by_execution: Optional[str] = None,
 ) -> DestructiveGrant:
     """Verify a grant against the exact requested tuple.
 
     Every mismatch (operation, vm, device, fs, label, session) is a DENY.
-    Expired and consumed grants are DENY.  Returns the grant on success.
+    Expired and consumed grants are DENY.  A grant claimed by ANOTHER
+    execution is DENY (concurrent use); a grant claimed by the calling
+    execution (``claimed_by_execution`` matches) verifies normally.
+    Returns the grant on success.
     """
     grant = load_grant(grant_id)
 
@@ -462,6 +599,28 @@ def verify_grant(
             }
         )
         raise GrantConsumedError(f"grant {grant_id!r} already consumed (replay denied)")
+
+    # B2: a grant claimed by another execution is in flight — verification
+    # must not pass it (no double-claim, no concurrent use).  The claiming
+    # execution itself verifies normally.
+    if grant.claimed_by_execution is not None:
+        if claimed_by_execution != grant.claimed_by_execution:
+            _audit(
+                {
+                    "event": "grant_denied",
+                    "grant_id": grant_id,
+                    "reason": "already_claimed",
+                    "claimed_by_execution": grant.claimed_by_execution,
+                    "requested": {
+                        "operation": operation, "vm_id": vm_id, "device": device,
+                        "fs_type": fs_type, "label": label, "session_id": session_id,
+                    },
+                }
+            )
+            raise GrantInFlightError(
+                f"grant {grant_id!r} is claimed by execution "
+                f"{grant.claimed_by_execution!r} (concurrent use denied)"
+            )
 
     if time.time() > grant.expires_at:
         _audit(
@@ -519,6 +678,219 @@ def verify_grant(
         }
     )
     return grant
+
+
+def claim_grant(grant_id: str, execution_id: str) -> DestructiveGrant:
+    """Atomically claim a grant for one execution (B2).
+
+    The claim is a rename of the live grant file to a ``.claimed`` suffix,
+    which is atomic on POSIX: exactly one concurrent caller wins.  The
+    claimed file records ``claimed_by_execution`` and ``claimed_at``.
+
+    Raises GrantNotFoundError if absent, GrantConsumedError if already
+    consumed, GrantInFlightError if already claimed by another execution,
+    and GrantDeniedError if the file was tampered.
+    """
+    if not isinstance(execution_id, str) or not execution_id:
+        raise GrantError("execution_id is required to claim a grant")
+
+    live = _grant_path(grant_id)
+    claimed_path = live.with_suffix(".json.claimed")
+    settled_path = live.with_suffix(".json.settled")
+    if not live.exists():
+        if claimed_path.exists():
+            raise GrantInFlightError(
+                f"grant {grant_id!r} is already claimed (concurrent use denied)"
+            )
+        consumed_path = live.with_suffix(".json.consumed")
+        if consumed_path.exists():
+            raise GrantConsumedError(f"grant {grant_id!r} already consumed (replay denied)")
+        if settled_path.exists():
+            raise GrantConsumedError(
+                f"grant {grant_id!r} already settled (replay denied)"
+            )
+        raise GrantNotFoundError(f"grant {grant_id!r} not found")
+
+    # Integrity BEFORE the rename: a tampered grant must be reported as
+    # tampered, not as "not found" after the claim moved the file away.
+    try:
+        with open(live, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        # The live file vanished between our existence check and our read:
+        # another caller claimed it in that window.  That is a lost claim,
+        # not a corrupt grant — report it as in-flight (or as replay if the
+        # winner already settled the grant before we reached the read).
+        if claimed_path.exists():
+            raise GrantInFlightError(
+                f"grant {grant_id!r} is already claimed (concurrent use denied)"
+            ) from exc
+        if settled_path.exists():
+            raise GrantConsumedError(
+                f"grant {grant_id!r} already settled (replay denied)"
+            ) from exc
+        raise GrantError(f"grant {grant_id!r} unreadable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        # The file may have been truncated by the winning caller between our
+        # open() and our read (the winner renames live -> .claimed and then
+        # rewrites the claimed file in place, truncating the same inode our
+        # fd still points to).  That is a lost claim, not corruption.
+        if claimed_path.exists():
+            raise GrantInFlightError(
+                f"grant {grant_id!r} is already claimed (concurrent use denied)"
+            ) from exc
+        if settled_path.exists():
+            raise GrantConsumedError(
+                f"grant {grant_id!r} already settled (replay denied)"
+            ) from exc
+        raise GrantError(f"grant {grant_id!r} unreadable: {exc}") from exc
+    pre_grant = DestructiveGrant.from_dict(data)
+    if pre_grant.grant_id != grant_id:
+        raise GrantDeniedError(
+            f"grant {grant_id!r} payload id mismatch (clone denied)"
+        )
+    recomputed = _binding_sha256(
+        pre_grant.grant_id, pre_grant.operation, pre_grant.vm_id,
+        pre_grant.hostname, pre_grant.device, pre_grant.fs_type,
+        pre_grant.label, pre_grant.authorization_subject,
+        pre_grant.session_id, pre_grant.nonce,
+        pre_grant.issued_at, pre_grant.expires_at,
+        pre_grant.authorization_evidence, pre_grant.incarnation_product_uuid,
+        pre_grant.incarnation_boot_id, pre_grant.incarnation_hostname,
+    )
+    if recomputed != pre_grant.binding_sha256:
+        raise GrantDeniedError(f"grant {grant_id!r} integrity check failed (tampered)")
+
+    claimed_path = live.with_suffix(".json.claimed")
+    try:
+        os.rename(live, claimed_path)
+    except OSError as exc:
+        # The rename lost a race: another caller claimed the grant between
+        # our integrity read and our rename.  That is a lost claim, not an
+        # error — report it as in-flight (or as replay if the winner already
+        # settled the grant before we reached the rename).
+        if claimed_path.exists():
+            raise GrantInFlightError(
+                f"grant {grant_id!r} is already claimed (concurrent use denied)"
+            ) from exc
+        if settled_path.exists():
+            raise GrantConsumedError(
+                f"grant {grant_id!r} already settled (replay denied)"
+            ) from exc
+        raise GrantError(f"grant {grant_id!r} claim failed: {exc}") from exc
+
+    try:
+        with open(claimed_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GrantError(f"claimed grant {grant_id!r} unreadable: {exc}") from exc
+
+    data["claimed_by_execution"] = execution_id
+    data["claimed_at"] = time.time()
+    with open(claimed_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, sort_keys=True, ensure_ascii=False)
+
+    grant = DestructiveGrant.from_dict(data)
+    _audit(
+        {
+            "event": "grant_claimed",
+            "grant_id": grant_id,
+            "execution_id": execution_id,
+            "operation": grant.operation,
+            "vm_id": grant.vm_id,
+            "device": grant.device,
+            "fs_type": grant.fs_type,
+            "label": grant.label,
+        }
+    )
+    return grant
+
+
+def settle_grant(grant_id: str, execution_id: str, outcome: str) -> DestructiveGrant:
+    """Durably settle a claimed grant (B2).
+
+    ``outcome`` is one of ``completed`` / ``failed_pre_effect`` /
+    ``indeterminate``.  The settlement is a rename of the ``.claimed`` file
+    to a ``.settled`` suffix (atomic on POSIX) and is bound to the claiming
+    execution: a mismatched ``execution_id`` is rejected.
+
+    Once settled, the grant is permanently out of the pool — an
+    ``indeterminate`` outcome NEVER returns the grant to the live set (no
+    blind retry after a possible mutation, per #90144/#90145).
+    """
+    if outcome not in VALID_SETTLEMENT_OUTCOMES:
+        raise GrantError(
+            f"invalid settlement outcome {outcome!r}; "
+            f"expected one of {VALID_SETTLEMENT_OUTCOMES}"
+        )
+
+    claimed_path = _grant_path(grant_id).with_suffix(".json.claimed")
+    if not claimed_path.exists():
+        raise GrantError(f"grant {grant_id!r} is not claimed (cannot settle)")
+
+    try:
+        with open(claimed_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GrantError(f"claimed grant {grant_id!r} unreadable: {exc}") from exc
+
+    if data.get("claimed_by_execution") != execution_id:
+        raise GrantError(
+            f"grant {grant_id!r} is claimed by execution "
+            f"{data.get('claimed_by_execution')!r}, not {execution_id!r}"
+        )
+
+    settled_path = _grant_path(grant_id).with_suffix(".json.settled")
+    try:
+        os.rename(claimed_path, settled_path)
+    except OSError as exc:
+        raise GrantError(f"grant {grant_id!r} settle failed: {exc}") from exc
+
+    data["settlement_outcome"] = outcome
+    data["settled_at"] = time.time()
+    with open(settled_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, sort_keys=True, ensure_ascii=False)
+
+    grant = DestructiveGrant.from_dict(data)
+    _audit(
+        {
+            "event": "grant_settled",
+            "grant_id": grant_id,
+            "execution_id": execution_id,
+            "outcome": outcome,
+            "operation": grant.operation,
+            "vm_id": grant.vm_id,
+            "device": grant.device,
+            "fs_type": grant.fs_type,
+            "label": grant.label,
+        }
+    )
+    return grant
+
+
+def get_grant_state(grant_id: str) -> str:
+    """Return the durable state of a grant: ``live``, ``claimed``,
+    ``settled:<outcome>``, ``consumed``, ``revoked``, or ``unknown``."""
+    live = _grant_path(grant_id)
+    if live.exists():
+        return "live"
+    for suffix, label in (
+        (".json.claimed", "claimed"),
+        (".json.settled", "settled"),
+        (".json.consumed", "consumed"),
+        (".json.revoked", "revoked"),
+    ):
+        p = live.with_suffix(suffix)
+        if p.exists():
+            if label == "settled":
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    return f"settled:{data.get('settlement_outcome', 'unknown')}"
+                except (OSError, json.JSONDecodeError):
+                    return "settled:unknown"
+            return label
+    return "unknown"
 
 
 def consume_grant(grant_id: str) -> DestructiveGrant:

@@ -134,15 +134,27 @@ def _qm_guest_exec(vm_id: str, guest_argv: List[str], timeout: int = DEFAULT_QGA
 
 
 def qga_guest_identity(vm_id: str) -> Dict[str, object]:
-    """Read-only: guest hostname + boot id via QGA."""
+    """Read-only: guest hostname + boot id + product_uuid via QGA.
+
+    ``product_uuid`` (``/sys/class/dmi/id/product_uuid``) is the stable
+    guest identity: it survives reboots and changes only when the VM is
+    recreated/replaced.  ``boot_id`` is the boot generation.  Together they
+    fence a grant to one exact incarnation (review #100694 blocker 3;
+    #90145 ABA witness).
+    """
     validate_vm_id(vm_id)
     hostname = _qm_guest_exec(vm_id, ["hostname"])
     bootid = _qm_guest_exec(vm_id, ["cat", "/proc/sys/kernel/random/boot_id"])
+    product_uuid = _qm_guest_exec(
+        vm_id, ["cat", "/sys/class/dmi/id/product_uuid"]
+    )
     return {
         "hostname": hostname["out_data"].strip(),
         "boot_id": bootid["out_data"].strip(),
+        "product_uuid": product_uuid["out_data"].strip(),
         "hostname_rc": hostname["exit_code"],
         "boot_id_rc": bootid["exit_code"],
+        "product_uuid_rc": product_uuid["exit_code"],
     }
 
 
@@ -174,7 +186,15 @@ def qga_prechecks(vm_id: str, device: str) -> Dict[str, object]:
         "holders": [],
         "docker_use": False,
         "fstab_use": False,
+        "boot_id": None,
     }
+
+    # boot_id: durable incarnation marker (generation fencing, #90145).  A
+    # reboot between precheck and action is a generation change and must be
+    # caught by the TOCTOU identity snapshot.
+    bootid = _qm_guest_exec(vm_id, ["cat", "/proc/sys/kernel/random/boot_id"])
+    if bootid["exit_code"] == 0 and bootid["out_data"].strip():
+        checks["boot_id"] = bootid["out_data"].strip()
 
     # lsblk -J -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINTS,FSTYPE <device>
     lsblk = _qm_guest_exec(

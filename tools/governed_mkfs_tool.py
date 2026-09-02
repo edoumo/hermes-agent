@@ -4,12 +4,16 @@ This tool is the structured alternative to the hardline-blocked ``mkfs`` in
 the generic terminal.  It implements the full mandate workflow:
 
     grant_id (opaque, issued by the user at a trusted boundary)
+    -> claim_grant (atomic reservation BEFORE any effect; one winner)
     -> verify_grant (exact tuple: operation/vm/device/fs/label/session)
+    -> qga_guest_identity (durable generation fencing: boot_id + hostname
+       must match the incarnation captured at issue time)
     -> qga_prechecks (all mandatory checks, fail-closed)
-    -> TOCTOU recheck (identity unchanged since precheck)
+    -> TOCTOU recheck (identity unchanged since precheck, boot_id included)
     -> qga_create_filesystem (argv built from allowlisted fields only)
     -> qga_postcheck (fs type + label + uuid)
-    -> consume_grant (atomic one-shot; replay denied)
+    -> settle_grant (durable settlement: completed / failed_pre_effect /
+       indeterminate; the grant NEVER returns to the pool once claimed)
 
 Red lines enforced here:
 
@@ -19,6 +23,10 @@ Red lines enforced here:
   cannot authorize this path: the grant is the ONLY authority, and it is
   verified against the exact tuple plus the live session id.
 * The model never sees grant internals — only the opaque ``grant_id``.
+* A mutation may have happened as soon as the execution step starts: any
+  failure from that point on is settled ``indeterminate`` and reported as
+  INDETERMINATE, never as a retryable DENY (review #100694 blocker 2;
+  #90144/#90145).
 """
 
 from __future__ import annotations
@@ -29,16 +37,20 @@ import time
 from typing import Dict, List, Optional
 
 from tools.destructive_grants import (
+    GrantConsumedError,
     GrantDeniedError,
     GrantError,
+    GrantInFlightError,
     GrantNotFoundError,
-    consume_grant,
+    claim_grant,
     load_grant,
+    settle_grant,
     verify_grant,
 )
 from tools.qga_structured import (
     QgaError,
     qga_create_filesystem,
+    qga_guest_identity,
     qga_postcheck,
     qga_prechecks,
 )
@@ -85,9 +97,9 @@ GOVERNED_MKFS_SCHEMA = {
 }
 
 
-def _deny(reason: str, **extra: object) -> str:
+def _deny(reason: str, *, decision: str = "DENY", **extra: object) -> str:
     payload: Dict[str, object] = {
-        "decision": "DENY",
+        "decision": decision,
         "reason": reason,
     }
     payload.update(extra)
@@ -147,6 +159,7 @@ def _identity_snapshot(checks: Dict[str, object]) -> Dict[str, object]:
         "filesystem_existing": checks.get("filesystem_existing"),
         "filesystem_signature": checks.get("filesystem_signature"),
         "holders": checks.get("holders"),
+        "boot_id": checks.get("boot_id"),
     }
 
 
@@ -171,8 +184,27 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
     if not session_id:
         return _deny("session_id_required", reason_detail="governed_mkfs requires a live session context")
 
+    # 0. Atomic claim BEFORE any effect (review #100694 blocker 2).  The claim
+    #    is a rename-based reservation: exactly one concurrent caller wins;
+    #    the loser is denied before any QGA call.  The claim is bound to this
+    #    execution id, which the settlement later re-checks.
+    execution_id = f"{session_id}:{grant_id}"
+    try:
+        claim_grant(grant_id, execution_id)
+    except GrantInFlightError as exc:
+        return _deny("claim_lost", detail=str(exc))
+    except GrantConsumedError as exc:
+        return _deny("grant_denied", detail=str(exc))
+    except GrantNotFoundError as exc:
+        return _deny("grant_denied", detail=str(exc))
+    except GrantDeniedError as exc:
+        return _deny("grant_denied", detail=str(exc))
+    except GrantError as exc:
+        return _deny("grant_error", detail=str(exc))
+
     # 1. Grant verification (exact tuple + expiry + integrity).  Any mismatch
-    #    raises and is recorded in the audit trail.
+    #    raises and is recorded in the audit trail.  A claimed grant is
+    #    rejected here (no double-claim).
     try:
         grant = verify_grant(
             grant_id,
@@ -182,80 +214,155 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
             fs_type=fs_type,
             label=label,
             session_id=session_id,
+            claimed_by_execution=execution_id,
         )
     except GrantDeniedError as exc:
-        return _deny("grant_denied", detail=str(exc))
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny("grant_denied", detail=str(exc), outcome="failed_pre_effect")
     except GrantNotFoundError as exc:
-        return _deny("grant_denied", detail=str(exc))
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny("grant_denied", detail=str(exc), outcome="failed_pre_effect")
     except GrantError as exc:
-        return _deny("grant_error", detail=str(exc))
-    # 2. Mandatory prechecks inside the guest (fail-closed).
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny("grant_error", detail=str(exc), outcome="failed_pre_effect")
+
+    # 2. Durable generation fencing at the sink (review #100694 blocker 3;
+    #    #90145).  The incarnation captured at issue time must match the live
+    #    guest right now.  A replaced/rebooted VM (ABA) is denied BEFORE any
+    #    mutation.
+    try:
+        identity = qga_guest_identity(vm_id)
+    except QgaError as exc:
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "incarnation_unavailable", detail=str(exc), outcome="failed_pre_effect",
+        )
+
+    if (
+        identity.get("product_uuid") != grant.incarnation_product_uuid
+        or identity.get("boot_id") != grant.incarnation_boot_id
+        or identity.get("hostname") != grant.incarnation_hostname
+    ):
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "incarnation_changed",
+            expected_product_uuid=grant.incarnation_product_uuid,
+            observed_product_uuid=identity.get("product_uuid"),
+            expected_boot_id=grant.incarnation_boot_id,
+            observed_boot_id=identity.get("boot_id"),
+            expected_hostname=grant.incarnation_hostname,
+            observed_hostname=identity.get("hostname"),
+            outcome="failed_pre_effect",
+        )
+
+    # 3. Mandatory prechecks inside the guest (fail-closed).
     try:
         prechecks = qga_prechecks(vm_id, device)
     except QgaError as exc:
-        return _deny("prechecks_unavailable", detail=str(exc))
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "prechecks_unavailable", detail=str(exc), outcome="failed_pre_effect",
+        )
 
     failures = _prechecks_pass(prechecks)
     if failures:
-        return _deny("prechecks_failed", failures=failures)
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "prechecks_failed", failures=failures, outcome="failed_pre_effect",
+        )
 
-    # 3. TOCTOU recheck: identity must be unchanged since the precheck.
+    # 4. TOCTOU recheck: identity must be unchanged since the precheck.
     #    The precheck and the action run back-to-back over the same QGA
     #    channel; we re-read the critical identity fields immediately before
-    #    executing and compare.
+    #    executing and compare (boot_id included: a reboot between precheck
+    #    and action is a generation change).
     try:
         recheck = qga_prechecks(vm_id, device)
     except QgaError as exc:
-        return _deny("toctou_recheck_unavailable", detail=str(exc))
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "toctou_recheck_unavailable", detail=str(exc),
+            outcome="failed_pre_effect",
+        )
 
     recheck_failures = _prechecks_pass(recheck)
     if recheck_failures:
-        return _deny("toctou_recheck_failed", failures=recheck_failures)
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "toctou_recheck_failed", failures=recheck_failures,
+            outcome="failed_pre_effect",
+        )
 
     before = _identity_snapshot(prechecks)
     after = _identity_snapshot(recheck)
     if before != after:
-        return _deny("toctou_identity_changed", before=before, after=after)
+        settle_grant(grant_id, execution_id, "failed_pre_effect")
+        return _deny(
+            "toctou_identity_changed", before=before, after=after,
+            outcome="failed_pre_effect",
+        )
 
-    # 4. Structured execution (argv built from allowlisted fields only).
+    # 5. Structured execution (argv built from allowlisted fields only).
+    #    From this point on a mutation MAY have happened: any failure is
+    #    settled as INDETERMINATE and the grant never returns to the pool.
     try:
         exec_result = qga_create_filesystem(vm_id, device, fs_type, label)
     except QgaError as exc:
-        return _deny("execution_failed", detail=str(exc))
+        settle_grant(grant_id, execution_id, "indeterminate")
+        return _deny(
+            "execution_failed", detail=str(exc), outcome="indeterminate",
+            decision="INDETERMINATE",
+        )
 
     exec_exit = exec_result.get("exit_code")
     if exec_exit != 0:
+        settle_grant(grant_id, execution_id, "indeterminate")
         return _deny(
             "execution_exit_nonzero",
             exit_code=exec_exit,
             err_data=str(exec_result.get("err_data", ""))[:500],
+            outcome="indeterminate",
+            decision="INDETERMINATE",
         )
 
-    # 5. Postcheck: filesystem type + label + uuid.
+    # 6. Postcheck: filesystem type + label + uuid.
     try:
         postcheck = qga_postcheck(vm_id, device, fs_type, label)
     except QgaError as exc:
-        return _deny("postcheck_unavailable", detail=str(exc))
+        settle_grant(grant_id, execution_id, "indeterminate")
+        return _deny(
+            "postcheck_unavailable", detail=str(exc), outcome="indeterminate",
+            decision="INDETERMINATE",
+        )
 
     if postcheck.get("filesystem") != fs_type:
+        settle_grant(grant_id, execution_id, "indeterminate")
         return _deny(
             "postcheck_fs_mismatch",
             expected=fs_type,
             observed=postcheck.get("filesystem"),
+            outcome="indeterminate",
+            decision="INDETERMINATE",
         )
     if postcheck.get("label") != label:
+        settle_grant(grant_id, execution_id, "indeterminate")
         return _deny(
             "postcheck_label_mismatch",
             expected=label,
             observed=postcheck.get("label"),
+            outcome="indeterminate",
+            decision="INDETERMINATE",
         )
 
-    # 6. Atomic one-shot consumption.  A second use of the same grant is
-    #    denied (replay protection).
+    # 7. Durable settlement: the grant is permanently out of the pool.  A
+    #    second use of the same grant is denied (replay protection).
     try:
-        consumed = consume_grant(grant_id)
+        settle_grant(grant_id, execution_id, "completed")
     except GrantError as exc:
-        return _deny("consume_failed", detail=str(exc))
+        return _deny(
+            "settle_failed", detail=str(exc), outcome="indeterminate",
+            decision="INDETERMINATE",
+        )
 
     return _allow(
         {
@@ -269,6 +376,7 @@ def _handle_governed_mkfs(args: Dict[str, object], **kwargs) -> str:
             "exit_code": exec_result.get("exit_code"),
             "capability_consumed": True,
             "grant_id": grant_id,
+            "outcome": "completed",
         }
     )
 

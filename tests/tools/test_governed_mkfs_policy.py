@@ -60,6 +60,16 @@ def _issue(
         label=label,
         authorization_subject=subject,
         session_id=session_id,
+        authorization_evidence={
+            "request_id": "req-11111111111111111111111111111111",
+            "request_digest": "d" * 64,
+            "decision": "once",
+            "principal": "Ed",
+            "surface": "cli",
+        },
+        incarnation_product_uuid="uuid-A",
+        incarnation_boot_id="boot-A",
+        incarnation_hostname=hostname,
         ttl_seconds=ttl,
     )
 
@@ -125,17 +135,23 @@ def _call(grant_id, *, device="/dev/sdb1", fs_type="ext4", label="MAILCOW_DOCKER
     )
 
 
-def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None):
+def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None,
+              identity=None):
     """Patch the structured QGA boundary with deterministic payloads.
 
     ``qga_prechecks`` is called twice by the tool (precheck then TOCTOU
     recheck); when ``recheck`` is provided it is returned on the second
-    call, otherwise the same payload is returned both times.
+    call, otherwise the same payload is returned both times.  ``identity``
+    is the incarnation payload returned by ``qga_guest_identity`` (defaults
+    to the grant's own incarnation).
     """
     prechecks = prechecks if prechecks is not None else _clean_prechecks()
     recheck = recheck if recheck is not None else prechecks
     exec_result = exec_result if exec_result is not None else _exec_ok()
     postcheck = postcheck if postcheck is not None else _postcheck_ok()
+    identity = identity if identity is not None else {
+        "hostname": "hp-mail", "boot_id": "boot-A", "product_uuid": "uuid-A",
+    }
 
     calls = {"n": 0}
 
@@ -146,6 +162,7 @@ def _mock_qga(prechecks=None, recheck=None, exec_result=None, postcheck=None):
     return patch.multiple(
         "tools.governed_mkfs_tool",
         qga_prechecks=_prechecks,
+        qga_guest_identity=lambda vm_id: dict(identity),
         qga_create_filesystem=lambda vm_id, device, fs_type, label: exec_result,
         qga_postcheck=lambda vm_id, device, fs_type, label: postcheck,
     )
@@ -228,8 +245,8 @@ class TestDenyWrongDevice:
             result = _call(grant.grant_id, device="/dev/sdc1")
         assert result["decision"] == "DENY"
         assert result["reason"] == "grant_denied"
-        # Grant must remain live (not consumed on deny).
-        assert dg.load_grant(grant.grant_id).consumed is False
+        # Grant must be settled failed_pre_effect (never returns to the pool).
+        assert dg.get_grant_state(grant.grant_id) == "settled:failed_pre_effect"
 
     def test_authorized_sdb1_requested_sdb(self):
         """Whole disk is a different target than the authorized partition."""
@@ -414,6 +431,16 @@ class TestDenyParameterMutation:
                 vm_id="148", hostname="hp-mail", device="/dev/sdb1",
                 fs_type="ext4", label="X",
                 authorization_subject="Ed", session_id="sess-1",
+                authorization_evidence={
+                    "request_id": "req-11111111111111111111111111111111",
+                    "request_digest": "d" * 64,
+                    "decision": "once",
+                    "principal": "Ed",
+                    "surface": "cli",
+                },
+                incarnation_product_uuid="uuid-A",
+                incarnation_boot_id="boot-A",
+                incarnation_hostname="hp-mail",
             )
 
 
@@ -456,24 +483,29 @@ class TestDenyToctou:
 
 
 class TestDenyExecutionFailure:
-    def test_nonzero_exit_denied_and_grant_not_consumed(self):
+    def test_nonzero_exit_indeterminate_and_grant_settled(self):
         grant = _issue()
         exec_result = _exec_ok()
         exec_result["exit_code"] = 1
         exec_result["err_data"] = "mkfs.ext4: Device or resource busy"
         with _mock_qga(exec_result=exec_result):
             result = _call(grant.grant_id)
-        assert result["decision"] == "DENY"
+        assert result["decision"] == "INDETERMINATE"
         assert result["reason"] == "execution_exit_nonzero"
-        # Grant stays live: a transient failure must not burn the capability.
-        assert dg.load_grant(grant.grant_id).consumed is False
+        assert result["outcome"] == "indeterminate"
+        # A mutation may have happened: the grant is settled indeterminate and
+        # NEVER returns to the pool (no blind retry).
+        assert dg.get_grant_state(grant.grant_id) == "settled:indeterminate"
+        with pytest.raises(dg.GrantConsumedError):
+            dg.load_grant(grant.grant_id)
 
-    def test_postcheck_fs_mismatch_denied(self):
+    def test_postcheck_fs_mismatch_indeterminate(self):
         grant = _issue()
         with _mock_qga(postcheck=_postcheck_ok(fs_type="xfs")):
             result = _call(grant.grant_id)
-        assert result["decision"] == "DENY"
+        assert result["decision"] == "INDETERMINATE"
         assert result["reason"] == "postcheck_fs_mismatch"
+        assert result["outcome"] == "indeterminate"
 
 
 class TestAuditTrail:
@@ -484,8 +516,9 @@ class TestAuditTrail:
         entries = dg.read_audit_trail()
         events = [e["event"] for e in entries]
         assert "grant_issued" in events
+        assert "grant_claimed" in events
         assert "grant_verified" in events
-        assert "grant_consumed" in events
+        assert "grant_settled" in events
         # No secrets in the trail (nonce is the only secret-bearing field;
         # binding_sha256 is a public integrity hash and is expected).
         blob = json.dumps(entries)

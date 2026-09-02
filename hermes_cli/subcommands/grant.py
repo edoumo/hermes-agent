@@ -4,6 +4,16 @@ This subcommand is the ONLY way a DestructiveGrant is created.  It runs in
 the user's own shell (CLI), never from a model tool, which makes
 agent-generated authorization structurally impossible.
 
+Issuance now requires (review #100694 blockers 1 & 3):
+
+* a live, read-only capture of the VM incarnation (hostname + boot_id) via
+  the structured QGA adapter — the grant is bound to that durable generation;
+* a correlated human approval decision obtained through the host approval
+  transport (or an explicit interactive TTY confirmation when no plugin
+  transport is configured).  The evidence (request_id + request_digest +
+  decision + principal + surface) is bound into the grant and cannot be
+  forged by any model surface.
+
 Usage:
 
     hermes grant issue --operation CREATE_FILESYSTEM --vm 148 --hostname hp-mail \
@@ -18,9 +28,105 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import getpass
+import hashlib
 import json
 import sys
-from typing import List, Optional
+import uuid
+from typing import Dict, List, Optional
+
+from tools.destructive_grants import GrantError
+
+
+def _obtain_human_evidence(args) -> Dict[str, object]:
+    """Obtain a correlated, one-shot human approval decision.
+
+    Prefers the host approval transport (``_present_with_selected_transport``
+    from tools.approval), which returns a request_id + request_digest bound
+    to the exact request the human saw.  Falls back to an explicit
+    interactive TTY confirmation when no plugin transport is configured.
+
+    Refuses to mint when no interactive TTY is available and no transport
+    produced a decision: a grant must never be issued unattended.
+    """
+    command = (
+        f"hermes grant issue --operation {args.operation} --vm {args.vm_id} "
+        f"--hostname {args.hostname} --device {args.device} "
+        f"--fs {args.fs_type} --label {args.label} "
+        f"--subject {args.subject} --session {args.session_id}"
+    )
+    description = (
+        f"One-shot destructive grant: CREATE_FILESYSTEM on VM {args.vm_id} "
+        f"({args.hostname}) device {args.device} as {args.fs_type} "
+        f"label {args.label}. This capability is consumed by exactly one "
+        f"governed operation and expires automatically."
+    )
+
+    try:
+        from tools.approval import _present_with_selected_transport
+    except Exception:
+        _present_with_selected_transport = None
+
+    if _present_with_selected_transport is not None:
+        try:
+            presented = _present_with_selected_transport(
+                command=command,
+                description=description,
+                pattern_key="governed_grant_issue",
+                pattern_keys=("governed_grant_issue",),
+                session_key=args.session_id,
+                surface="cli",
+                allow_session=False,
+                allow_permanent=False,
+            )
+        except Exception as exc:
+            raise GrantError(f"approval transport failed: {exc}") from exc
+
+        if presented.get("selected"):
+            if presented.get("choice") != "once" or presented.get("failure"):
+                raise GrantError(
+                    "human approval not granted (transport decision: "
+                    f"{presented.get('choice') or presented.get('failure')})"
+                )
+            return {
+                "request_id": presented["request_id"],
+                "request_digest": presented["request_digest"],
+                "decision": "once",
+                "principal": getpass.getuser(),
+                "surface": "cli",
+            }
+
+    # Builtin path: explicit interactive confirmation on a real TTY.
+    if not sys.stdin.isatty():
+        raise GrantError(
+            "grant issue requires an interactive terminal (or a configured "
+            "approval transport): refusing unattended issuance"
+        )
+    print("=" * 72, file=sys.stderr)
+    print("DESTRUCTIVE CAPABILITY GRANT — explicit human approval required", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(f"operation : {args.operation}", file=sys.stderr)
+    print(f"vm        : {args.vm_id} ({args.hostname})", file=sys.stderr)
+    print(f"device    : {args.device}", file=sys.stderr)
+    print(f"fs_type   : {args.fs_type}", file=sys.stderr)
+    print(f"label     : {args.label}", file=sys.stderr)
+    print(f"session   : {args.session_id}", file=sys.stderr)
+    print(f"ttl       : {args.ttl}s (max {3600}s)", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    answer = input("Type APPROVE to issue this one-shot grant, anything else to cancel: ")
+    if answer.strip() != "APPROVE":
+        raise GrantError("grant issuance cancelled by the user")
+
+    canonical = "|".join(
+        [command, description, args.session_id, getpass.getuser()]
+    )
+    return {
+        "request_id": str(uuid.uuid4()),
+        "request_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "decision": "once",
+        "principal": getpass.getuser(),
+        "surface": "cli",
+    }
 
 
 def build_grant_parser(subparsers, *, cmd_grant=None) -> None:
@@ -68,6 +174,33 @@ def run_grant_command(args) -> int:
 
     if cmd == "issue":
         try:
+            # B3: capture the durable VM incarnation at issue time (read-only).
+            from tools.qga_structured import QgaError, qga_guest_identity
+
+            try:
+                identity = qga_guest_identity(args.vm_id)
+            except QgaError as exc:
+                print(f"ERROR: cannot capture VM incarnation (QGA): {exc}", file=sys.stderr)
+                return 2
+            if not identity.get("product_uuid") or not identity.get("boot_id") \
+                    or not identity.get("hostname"):
+                print(
+                    "ERROR: VM incarnation incomplete "
+                    "(product_uuid/boot_id/hostname missing)",
+                    file=sys.stderr,
+                )
+                return 2
+            if identity.get("hostname") != args.hostname:
+                print(
+                    f"ERROR: live guest hostname {identity.get('hostname')!r} "
+                    f"does not match --hostname {args.hostname!r}",
+                    file=sys.stderr,
+                )
+                return 2
+
+            # B1: correlated human approval decision.
+            evidence = _obtain_human_evidence(args)
+
             grant = issue_grant(
                 operation=args.operation,
                 vm_id=args.vm_id,
@@ -77,6 +210,10 @@ def run_grant_command(args) -> int:
                 label=args.label,
                 authorization_subject=args.subject,
                 session_id=args.session_id,
+                authorization_evidence=evidence,
+                incarnation_product_uuid=identity["product_uuid"],
+                incarnation_boot_id=identity["boot_id"],
+                incarnation_hostname=identity["hostname"],
                 ttl_seconds=args.ttl,
             )
         except GrantError as exc:
@@ -95,6 +232,8 @@ def run_grant_command(args) -> int:
             print(f"authorization_subject={grant.authorization_subject}")
             print(f"authorization_source={grant.authorization_source}")
             print(f"session_id={grant.session_id}")
+            print(f"incarnation_product_uuid={grant.incarnation_product_uuid}")
+            print(f"incarnation_boot_id={grant.incarnation_boot_id}")
             print(f"expires_at={grant.expires_at}")
             print("NOTE: the grant is one-shot and expires automatically.")
         return 0

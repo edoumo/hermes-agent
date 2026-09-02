@@ -489,7 +489,6 @@ from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.verify import build_verify_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.approvals import build_approvals_parser
-from hermes_cli.subcommands.grant import build_grant_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -5945,16 +5944,6 @@ def cmd_approvals(args):
     from hermes_cli.approvals_suggest import approvals_command
 
     status = approvals_command(args)
-    if status:
-        sys.exit(status)
-    return status
-
-
-def cmd_grant(args):
-    """Dispatch `hermes grant <subcmd>` (trusted user boundary)."""
-    from hermes_cli.subcommands.grant import run_grant_command
-
-    status = run_grant_command(args)
     if status:
         sys.exit(status)
     return status
@@ -12525,7 +12514,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "grant", "hooks", "import", "import-agent", "insights",
+        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
@@ -13844,12 +13833,6 @@ def main():
     # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
     # =========================================================================
     build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
-
-    # =========================================================================
-    # grant command  (parser built in hermes_cli/subcommands/grant.py)
-    # trusted user boundary for one-shot destructive capability grants
-    # =========================================================================
-    build_grant_parser(subparsers, cmd_grant=cmd_grant)
 
     # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)
